@@ -1,3 +1,4 @@
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/float
 import gleam/http
@@ -5,11 +6,13 @@ import gleam/http/request
 import gleam/httpc
 import gleam/int
 import gleam/io
+import gleam/json
 import gleam/list
+import gleam/result
 import gleam/string
 import gleam/uri
 
-const total_users = 100_000
+const total_users = 2
 
 const api_host = "localhost"
 
@@ -154,11 +157,95 @@ fn run_simulation(post_tracker: process.Subject(PostTrackingMessage)) {
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
+// Helper to format float to a string with a given precision
+fn float_to_string(f: Float, precision p: Int) -> String {
+  float.to_string(f)
+  |> string.split(".")
+  |> fn(parts) {
+    case parts {
+      [i, d] -> i <> "." <> string.slice(d, 0, p)
+      _ -> float.to_string(f)
+    }
+  }
+}
+
+// Define the record structure for performance metrics
+type PerformanceMetrics {
+  PerformanceMetrics(
+    total_users: Int,
+    total_posts: Int,
+    total_comments: Int,
+    total_votes: Int,
+    total_messages: Int,
+    posts_per_second: Float,
+    messages_per_second: Float,
+  )
+}
+
+// Define a decoder for the PerformanceMetrics
+fn performance_metrics_decoder() -> decode.Decoder(PerformanceMetrics) {
+  use total_users <- decode.field("total_users", decode.int)
+  use total_posts <- decode.field("total_posts", decode.int)
+  use total_comments <- decode.field("total_comments", decode.int)
+  use total_votes <- decode.field("total_votes", decode.int)
+  use total_messages <- decode.field("total_messages", decode.int)
+  use posts_per_second <- decode.field("posts_per_second", decode.float)
+  use messages_per_second <- decode.field("messages_per_second", decode.float)
+  decode.success(PerformanceMetrics(
+    total_users,
+    total_posts,
+    total_comments,
+    total_votes,
+    total_messages,
+    posts_per_second,
+    messages_per_second,
+  ))
+}
+
 fn report_engine_metrics() {
   case get_engine_metrics() {
     Ok(metrics_json) -> {
-      io.println("Engine Metrics (JSON):")
-      io.println(metrics_json)
+      case json.parse(metrics_json, performance_metrics_decoder()) {
+        Ok(metrics) -> {
+          // Format and print the metrics in a table
+          let longest_label_length =
+            ["Users", "Posts", "Comments", "Votes", "Messages"]
+            |> list.map(string.length)
+            |> list.max(int.compare)
+            |> result.unwrap(0)
+
+          let print_row = fn(label: String, value: String) {
+            io.println(
+              "  "
+              <> string.pad_end(label, longest_label_length, " ")
+              <> " : "
+              <> value,
+            )
+          }
+
+          print_row("Users", int.to_string(metrics.total_users))
+          print_row("Posts", int.to_string(metrics.total_posts))
+          print_row("Comments", int.to_string(metrics.total_comments))
+          print_row("Votes", int.to_string(metrics.total_votes))
+          print_row("Messages", int.to_string(metrics.total_messages))
+
+          io.println("")
+          print_row(
+            "Posts/sec",
+            float_to_string(metrics.posts_per_second, precision: 3),
+          )
+          print_row(
+            "Messages/sec",
+            float_to_string(metrics.messages_per_second, precision: 3),
+          )
+        }
+        Error(_) -> {
+          io.println("Failed to decode engine metrics JSON.")
+          // Fallback to printing the raw JSON
+          io.println("Engine Metrics (JSON):")
+          io.println(metrics_json)
+        }
+      }
     }
     Error(_) -> {
       io.println("Could not retrieve engine metrics.")

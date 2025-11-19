@@ -66,26 +66,26 @@ pub fn main() -> Nil {
   process.send(engine_actor.data, RefreshEngineMetrics)
   printi("✓ Reddit engine actor started")
 
-  // Start distributed Erlang with longnames
-  net_kernel_start(charlist.from_string("reddit_engine"))
-  set_cookie("reddit_engine", "secret")
-  printi("✓ Started distributed Erlang node")
+  // // Start distributed Erlang with longnames
+  // net_kernel_start(charlist.from_string("reddit_engine"))
+  // set_cookie("reddit_engine", "secret")
+  // printi("✓ Started distributed Erlang node")
 
-  // Register globally so it's accessible from other nodes
-  let global_reg_result = register_global("reddit_engine", engine_actor.pid)
-  case global_reg_result {
-    Ok(_) -> printi("✓ Reddit engine registered globally!")
-    Error(msg) -> printi("✗ Global registration failed: " <> msg)
-  }
+  // // Register globally so it's accessible from other nodes
+  // let global_reg_result = register_global("reddit_engine", engine_actor.pid)
+  // case global_reg_result {
+  //   Ok(_) -> printi("✓ Reddit engine registered globally!")
+  //   Error(msg) -> printi("✗ Global registration failed: " <> msg)
+  // }
 
-  io.print("\nGlobal names: ")
-  echo list_global_names()
+  // io.print("\nGlobal names: ")
+  // echo list_global_names()
 
-  printi("\nConnected nodes:")
-  echo list_nodes()
+  // printi("\nConnected nodes:")
+  // echo list_nodes()
 
-  printi("\nCurrent cookie:")
-  echo get_cookie_erlang()
+  // printi("\nCurrent cookie:")
+  // echo get_cookie_erlang()
 
   // Start web server
   let assert Ok(_) =
