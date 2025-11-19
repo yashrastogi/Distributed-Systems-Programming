@@ -69,7 +69,7 @@ pub fn uuid_gen() -> Uuid {
   Uuid(value: value)
 }
 
-pub opaque type Uuid {
+pub type Uuid {
   Uuid(value: BitArray)
 }
 

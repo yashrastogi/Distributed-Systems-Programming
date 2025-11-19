@@ -1,15 +1,19 @@
-import gleam/erlang/charlist
 import gleam/erlang/process
 import gleam/float
+import gleam/http
+import gleam/http/request
+import gleam/httpc
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/time/duration
-import gleam/time/timestamp
-import models.{type PostId}
-import reddit_engine
+import gleam/string
+import gleam/uri
 
-const total_users = 9
+const total_users = 100_000
+
+const api_host = "localhost"
+
+const api_port = 8080
 
 // Rank subreddits by expected popularity
 const subreddits_by_rank = [
@@ -33,42 +37,15 @@ pub fn main() {
     <> " users with realistic behavior patterns\n",
   )
 
-  reddit_engine.net_kernel_start(charlist.from_string("simulator"))
-  reddit_engine.set_cookie("simulator", "secret")
-  io.println("✓ Simulator node started")
+  // Start post tracking actor
+  let post_tracker = start_post_tracker()
 
-  let server_node = "reddit_engine@Yashs-MacBook-Air.local"
-  process.sleep(1000)
-  let ping_result = reddit_engine.ping_erlang(charlist.from_string(server_node))
-
-  case ping_result {
-    reddit_engine.Pong -> {
-      io.println("✓ Connected to " <> server_node)
-      process.sleep(1000)
-
-      case reddit_engine.whereis_global("reddit_engine") {
-        Ok(engine_pid) -> {
-          io.println("✓ Found reddit engine\n")
-
-          // Start post tracking actor
-          let post_tracker = start_post_tracker()
-
-          run_simulation(engine_pid, "reddit_engine", post_tracker)
-        }
-        Error(_) -> {
-          io.println("✗ Could not find reddit engine")
-        }
-      }
-    }
-    reddit_engine.Pang -> {
-      io.println("✗ Failed to connect to server")
-    }
-  }
+  run_simulation(post_tracker)
 }
 
 pub type PostTrackingMessage {
-  AddPost(subreddit: String, post_id: PostId)
-  GetRandomPost(reply_to: process.Subject(Result(#(String, PostId), Nil)))
+  AddPost(subreddit: String, post_id: String)
+  GetRandomPost(reply_to: process.Subject(Result(#(String, String), Nil)))
 }
 
 // Actor to track posts across all users for voting/commenting
@@ -89,7 +66,7 @@ fn start_post_tracker() -> process.Subject(PostTrackingMessage) {
 
 fn post_tracker_loop(
   subject: process.Subject(PostTrackingMessage),
-  posts: List(#(String, PostId)),
+  posts: List(#(String, String)),
 ) {
   case process.receive(subject, 10) {
     Ok(AddPost(subreddit, post_id)) -> {
@@ -110,11 +87,7 @@ fn post_tracker_loop(
   }
 }
 
-fn run_simulation(
-  engine_pid: process.Pid,
-  server_node: String,
-  post_tracker: process.Subject(PostTrackingMessage),
-) {
+fn run_simulation(post_tracker: process.Subject(PostTrackingMessage)) {
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
   io.println("Phase 1: Setting up Subreddits")
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
@@ -122,11 +95,7 @@ fn run_simulation(
   // Create subreddits
   list.each(subreddits_by_rank, fn(subreddit) {
     let #(name, desc, _) = subreddit
-    send_message(
-      engine_pid,
-      server_node,
-      reddit_engine.CreateSubreddit(name: name, description: desc),
-    )
+    let _ = create_subreddit(name, desc)
     io.println("✓ Created subreddit: " <> name)
   })
   io.println("")
@@ -148,13 +117,7 @@ fn run_simulation(
       // Spawn each user as a separate process
       let user_pid =
         process.spawn_unlinked(fn() {
-          simulate_user(
-            engine_pid,
-            server_node,
-            username,
-            is_power_user,
-            post_tracker,
-          )
+          simulate_user(username, is_power_user, post_tracker)
 
           // Track completion
           process.send(completion_subject, username)
@@ -178,53 +141,24 @@ fn run_simulation(
   io.println("Subreddit Membership Distribution (Zipf)")
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-  report_membership_distribution(engine_pid, server_node)
+  report_membership_distribution()
 
   io.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
   io.println("Engine Performance Metrics")
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-  report_engine_metrics(engine_pid, server_node)
+  report_engine_metrics()
 
   io.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
   io.println("Simulation Complete!")
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
-fn report_engine_metrics(engine_pid: process.Pid, server_node: String) {
-  let reply_sub = process.new_subject()
-  send_message(
-    engine_pid,
-    server_node,
-    reddit_engine.GetEngineMetrics(reply_to: reply_sub),
-  )
-  case process.receive(reply_sub, 1000) {
-    Ok(metrics) -> {
-      io.println(
-        "Time Elapsed (s): "
-        <> duration.to_seconds(timestamp.difference(
-          metrics.simulation_start_time,
-          metrics.simulation_checkpoint_time,
-        ))
-        |> float.to_precision(2)
-        |> float.to_string,
-      )
-      io.println("Total Posts Created: " <> int.to_string(metrics.total_posts))
-      io.println(
-        "Total Messages Processed: " <> int.to_string(metrics.total_messages),
-      )
-      io.println(
-        "Total Comments Processed: " <> int.to_string(metrics.total_comments),
-      )
-      io.println(
-        "Total Votes Processed: " <> int.to_string(metrics.total_votes),
-      )
-      io.println(
-        "Posts per Second: " <> float.to_string(metrics.posts_per_second),
-      )
-      io.println(
-        "Messages per Second: " <> float.to_string(metrics.messages_per_second),
-      )
+fn report_engine_metrics() {
+  case get_engine_metrics() {
+    Ok(metrics_json) -> {
+      io.println("Engine Metrics (JSON):")
+      io.println(metrics_json)
     }
     Error(_) -> {
       io.println("Could not retrieve engine metrics.")
@@ -232,20 +166,11 @@ fn report_engine_metrics(engine_pid: process.Pid, server_node: String) {
   }
 }
 
-fn report_membership_distribution(engine_pid: process.Pid, server_node: String) {
+fn report_membership_distribution() {
   list.each(subreddits_by_rank, fn(subreddit) {
     let #(name, _, rank) = subreddit
-    let reply_sub = process.new_subject()
-    send_message(
-      engine_pid,
-      server_node,
-      reddit_engine.GetSubredditMemberCount(
-        subreddit_id: name,
-        reply_to: reply_sub,
-      ),
-    )
-    case process.receive_forever(reply_sub) {
-      count -> {
+    case get_subreddit_member_count(name) {
+      Ok(count) -> {
         io.println(
           "Rank "
           <> int.to_string(rank)
@@ -255,6 +180,7 @@ fn report_membership_distribution(engine_pid: process.Pid, server_node: String) 
           <> int.to_string(count),
         )
       }
+      Error(_) -> Nil
     }
   })
 }
@@ -279,21 +205,12 @@ fn wait_for_completions(
 
 // Each user actor runs this function independently
 fn simulate_user(
-  engine_pid: process.Pid,
-  server_node: String,
   username: String,
   is_power_user: Bool,
   post_tracker: process.Subject(PostTrackingMessage),
 ) {
   // 1. Register the user
-  send_message(
-    engine_pid,
-    server_node,
-    reddit_engine.UserRegister(
-      username: username,
-      reply_to: process.new_subject(),
-    ),
-  )
+  let _ = register_user(username)
   process.sleep(int.random(100) + 50)
 
   // 2. Join subreddits
@@ -307,11 +224,7 @@ fn simulate_user(
   list.range(1, num_joins)
   |> list.each(fn(_) {
     let subreddit = pick_random_subreddit(is_power_user)
-    send_message(
-      engine_pid,
-      server_node,
-      reddit_engine.JoinSubreddit(username: username, subreddit_name: subreddit),
-    )
+    let _ = join_subreddit(username, subreddit)
     process.sleep(int.random(200) + 100)
   })
 
@@ -334,14 +247,7 @@ fn simulate_user(
     }
     io.println("... " <> username <> " going online ...")
     // Perform activities while online
-    perform_online_activities(
-      engine_pid,
-      server_node,
-      username,
-      is_power_user,
-      cycle,
-      post_tracker,
-    )
+    perform_online_activities(username, is_power_user, cycle, post_tracker)
 
     // Stay online for a while
     process.sleep(online_duration)
@@ -357,8 +263,6 @@ fn simulate_user(
 }
 
 fn perform_online_activities(
-  engine_pid: process.Pid,
-  server_node: String,
   username: String,
   is_power_user: Bool,
   cycle: Int,
@@ -387,24 +291,18 @@ fn perform_online_activities(
         }
 
         // Create post and get response with post_id
-        let reply_subject = process.new_subject()
-        send_message(
-          engine_pid,
-          server_node,
-          reddit_engine.CreatePostWithReply(
-            username: username,
-            subreddit_id: subreddit,
-            title: title,
-            content: generate_content(cycle * 100 + activity_num),
-            reply_to: reply_subject,
-          ),
-        )
-
-        // Wait for post_id response and track it
-        case process.receive(reply_subject, 1000) {
+        case
+          create_post(
+            username,
+            subreddit,
+            title,
+            generate_content(cycle * 100 + activity_num),
+          )
+        {
           Ok(post_id) -> {
             process.send(post_tracker, AddPost(subreddit, post_id))
           }
+
           Error(_) -> Nil
         }
 
@@ -418,16 +316,13 @@ fn perform_online_activities(
 
         case process.receive(reply_subject, 100) {
           Ok(Ok(#(subreddit, post_id))) -> {
-            send_message(
-              engine_pid,
-              server_node,
-              reddit_engine.CommentOnPost(
-                username: username,
-                subreddit_id: subreddit,
-                post_id: post_id,
-                content: "Great post! Here are my thoughts...",
-              ),
-            )
+            let _ =
+              comment_on_post(
+                username,
+                subreddit,
+                post_id,
+                "Great post! Here are my thoughts...",
+              )
             process.sleep(int.random(200) + 50)
           }
           _ -> Nil
@@ -438,15 +333,8 @@ fn perform_online_activities(
       5 | 6 -> {
         let recipient = "user" <> int.to_string(int.random(total_users) + 1)
 
-        send_message(
-          engine_pid,
-          server_node,
-          reddit_engine.SendDirectMessage(
-            from_username: username,
-            to_username: recipient,
-            content: "Hey! How are you doing?",
-          ),
-        )
+        let _ =
+          send_direct_message(username, recipient, "Hey! How are you doing?")
         process.sleep(int.random(200) + 50)
       }
 
@@ -458,20 +346,11 @@ fn perform_online_activities(
         case process.receive(reply_subject, 100) {
           Ok(Ok(#(subreddit, post_id))) -> {
             let vote = case int.random(2) {
-              0 -> models.Upvote
-              _ -> models.Downvote
+              0 -> "upvote"
+              _ -> "downvote"
             }
 
-            send_message(
-              engine_pid,
-              server_node,
-              reddit_engine.VotePost(
-                subreddit_id: subreddit,
-                username: username,
-                post_id: post_id,
-                vote: vote,
-              ),
-            )
+            let _ = vote_post(username, subreddit, post_id, vote)
             process.sleep(int.random(100) + 50)
           }
           _ -> Nil
@@ -480,12 +359,7 @@ fn perform_online_activities(
 
       // 10% Get their feed
       _ -> {
-        let reply_subject = process.new_subject()
-        send_message(
-          engine_pid,
-          server_node,
-          reddit_engine.GetFeed(username: username, reply_to: reply_subject),
-        )
+        let _ = get_feed(username)
         // Don't wait for reply, just fire and forget
         process.sleep(int.random(100) + 50)
       }
@@ -513,10 +387,6 @@ fn pick_random_subreddit(is_power_user: Bool) -> String {
       }
     }
   }
-}
-
-fn send_message(engine_pid: process.Pid, server_node: String, message: a) {
-  reddit_engine.send_to_named_subject(engine_pid, server_node, message)
 }
 
 fn generate_title(index: Int) -> String {
@@ -592,5 +462,149 @@ fn select_by_cumulative_probability(
           )
       }
     }
+  }
+}
+
+// HTTP API Helpers
+
+fn register_user(username: String) -> Result(String, String) {
+  let body = "username=" <> username
+  post_request("/register", body)
+}
+
+fn create_subreddit(
+  title: String,
+  description: String,
+) -> Result(String, String) {
+  let body = "title=" <> title <> "&description=" <> description
+  post_request("/create/subreddit", body)
+}
+
+fn join_subreddit(username: String, subreddit: String) -> Result(String, String) {
+  let body = "username=" <> username <> "&subreddit=" <> subreddit
+  post_request("/join/subreddit", body)
+}
+
+fn create_post(
+  username: String,
+  subreddit: String,
+  title: String,
+  content: String,
+) -> Result(String, String) {
+  let body =
+    "username="
+    <> username
+    <> "&subreddit="
+    <> subreddit
+    <> "&title="
+    <> title
+    <> "&content="
+    <> content
+
+  post_request("/create/post", body)
+}
+
+fn comment_on_post(
+  username: String,
+  subreddit: String,
+  post_id: String,
+  content: String,
+) -> Result(String, String) {
+  let body =
+    "username="
+    <> username
+    <> "&subreddit="
+    <> subreddit
+    <> "&post_id="
+    <> uri.percent_encode(post_id)
+    <> "&content="
+    <> content
+  post_request("/comment/post", body)
+}
+
+fn vote_post(
+  username: String,
+  subreddit: String,
+  post_id: String,
+  vote: String,
+) -> Result(String, String) {
+  let body =
+    "username="
+    <> username
+    <> "&subreddit="
+    <> subreddit
+    <> "&post_id="
+    <> uri.percent_encode(post_id)
+    <> "&vote="
+    <> vote
+  post_request("/vote", body)
+}
+
+fn send_direct_message(
+  from: String,
+  to: String,
+  content: String,
+) -> Result(String, String) {
+  let body = "from=" <> from <> "&to=" <> to <> "&content=" <> content
+  post_request("/dm", body)
+}
+
+fn get_feed(username: String) -> Result(String, String) {
+  get_request("/feed/" <> username)
+}
+
+fn get_subreddit_member_count(subreddit: String) -> Result(Int, String) {
+  case get_request("/subreddit/members/" <> subreddit) {
+    Ok(body) -> {
+      case int.parse(body) {
+        Ok(i) -> Ok(i)
+        Error(_) -> Error("Failed to parse member count")
+      }
+    }
+    Error(e) -> Error(e)
+  }
+}
+
+fn get_engine_metrics() -> Result(String, String) {
+  get_request("/metrics")
+}
+
+fn post_request(path: String, body: String) -> Result(String, String) {
+  let req =
+    request.new()
+    |> request.set_method(http.Post)
+    |> request.set_scheme(http.Http)
+    |> request.set_host(api_host)
+    |> request.set_port(api_port)
+    |> request.set_path(path)
+    |> request.set_body(body)
+    |> request.set_header("content-type", "application/x-www-form-urlencoded")
+
+  case httpc.send(req) {
+    Ok(resp) ->
+      case resp.status {
+        200 | 201 -> Ok(resp.body)
+        _ -> Error("Request failed with status " <> int.to_string(resp.status))
+      }
+    Error(_) -> Error("HTTP request failed")
+  }
+}
+
+fn get_request(path: String) -> Result(String, String) {
+  let req =
+    request.new()
+    |> request.set_method(http.Get)
+    |> request.set_scheme(http.Http)
+    |> request.set_host(api_host)
+    |> request.set_port(api_port)
+    |> request.set_path(path)
+
+  case httpc.send(req) {
+    Ok(resp) ->
+      case resp.status {
+        200 -> Ok(resp.body)
+        _ -> Error("Request failed with status " <> int.to_string(resp.status))
+      }
+    Error(_) -> Error("HTTP request failed")
   }
 }
