@@ -1,11 +1,9 @@
 import gleam/bit_array
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/erlang/atom
-import gleam/erlang/charlist.{type Charlist}
 import gleam/erlang/process
 import gleam/float
-import gleam/http.{Get, Post}
+import gleam/http.{Delete, Get, Post, Put}
 import gleam/int
 import gleam/io
 import gleam/json
@@ -13,13 +11,16 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/set
+import gleam/string
 import gleam/time/duration
 import gleam/time/timestamp
+import gleam/uri
 import middleware
 import mist
 import models.{
-  type CommentId, type DirectMessage, type Post, type PostId, type Subreddit,
-  type SubredditId, type User, type Username, type VoteType, Downvote, Upvote,
+  type CommentId, type DirectMessage, type PerformanceMetrics, type Post,
+  type PostId, type Subreddit, type SubredditId, type User, type Username,
+  type VoteType, Downvote, Upvote,
 }
 import wisp
 import wisp/wisp_mist
@@ -33,9 +34,6 @@ pub fn main() -> Nil {
   printi("       Reddit Engine Starting Up")
   printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-  // Create a static name from atom for consistent distributed addressing
-  let engine_name = atom_to_name(atom.create("reddit_engine"))
-
   // Initialize and start the actor with named subject
   let assert Ok(engine_actor) =
     actor.new_with_initialiser(1000, fn(self_sub) {
@@ -43,7 +41,7 @@ pub fn main() -> Nil {
         self_subject: self_sub,
         users: dict.new(),
         subreddits: dict.new(),
-        metrics: PerformanceMetrics(
+        metrics: models.PerformanceMetrics(
           total_users: 0,
           total_posts: 0,
           total_comments: 0,
@@ -59,33 +57,11 @@ pub fn main() -> Nil {
       |> actor.returning(self_sub)
       |> Ok
     })
-    |> actor.named(engine_name)
     |> actor.on_message(engine_message_handler)
     |> actor.start
 
   process.send(engine_actor.data, RefreshEngineMetrics)
   printi("✓ Reddit engine actor started")
-
-  // // Start distributed Erlang with longnames
-  // net_kernel_start(charlist.from_string("reddit_engine"))
-  // set_cookie("reddit_engine", "secret")
-  // printi("✓ Started distributed Erlang node")
-
-  // // Register globally so it's accessible from other nodes
-  // let global_reg_result = register_global("reddit_engine", engine_actor.pid)
-  // case global_reg_result {
-  //   Ok(_) -> printi("✓ Reddit engine registered globally!")
-  //   Error(msg) -> printi("✗ Global registration failed: " <> msg)
-  // }
-
-  // io.print("\nGlobal names: ")
-  // echo list_global_names()
-
-  // printi("\nConnected nodes:")
-  // echo list_nodes()
-
-  // printi("\nCurrent cookie:")
-  // echo get_cookie_erlang()
 
   // Start web server
   let assert Ok(_) =
@@ -94,6 +70,7 @@ pub fn main() -> Nil {
       wisp.random_string(64),
     )
     |> mist.new
+    |> mist.bind("0.0.0.0")
     |> mist.port(8080)
     |> mist.start
 
@@ -105,6 +82,13 @@ pub fn main() -> Nil {
   Nil
 }
 
+fn get_form_params(
+  formdata: wisp.FormData,
+  param_names: List(String),
+) -> Result(List(String), Nil) {
+  list.try_map(param_names, fn(name) { list.key_find(formdata.values, name) })
+}
+
 pub fn handle_request(
   req: wisp.Request,
   engine_inbox: process.Subject(EngineMessage),
@@ -113,71 +97,81 @@ pub fn handle_request(
   case wisp.path_segments(req) {
     [] -> wisp.ok() |> wisp.html_body("<h1>Reddit Engine running.</h1>")
 
-    // POST /register
+    // POST /users
     // Registers a new user.
     // Body: "username"
-    ["register"] -> {
+    ["users"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
 
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
+      let username_r = list.key_find(formdata.values, "username")
 
-      case username {
-        "" -> wisp.bad_request("Invalid username")
-
-        _ -> {
+      case username_r {
+        Ok(username) -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) { UserRegister(username, r) })
 
           case result {
-            True -> wisp.ok() |> wisp.html_body("User registered successfully")
-            False -> wisp.response(409) |> wisp.html_body("User exists")
+            True ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("message", json.string("User registered successfully")),
+                  ]),
+                ),
+                201,
+              )
+            False ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([#("error", json.string("User exists"))]),
+                ),
+                409,
+              )
           }
         }
+        Error(_) -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // POST /create/subreddit
+    // POST /subreddits
     // Creates a new subreddit.
-    // Body: "title", "description"
-    ["create", "subreddit"] -> {
+    // Body: "username", "title", "description"
+    ["subreddits"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
 
-      let title = case list.key_find(formdata.values, "title") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-
-      let description = case list.key_find(formdata.values, "description") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-
-      case title {
-        "" -> wisp.bad_request("Invalid title")
-
-        _ -> {
+      case get_form_params(formdata, ["username", "title", "description"]) {
+        Ok([username, title, description]) -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
-              CreateSubreddit(title, description, r)
+              CreateSubreddit(username, title, description, r)
             })
 
           case result {
-            True ->
-              wisp.ok() |> wisp.html_body("Subreddit created successfully")
-            False -> wisp.response(409) |> wisp.html_body("Subreddit exists")
+            Ok(msg) ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("message", json.string(msg)),
+                  ]),
+                ),
+                201,
+              )
+            Error(err) ->
+              wisp.json_response(
+                json.to_string(json.object([#("error", json.string(err))])),
+                400,
+              )
           }
         }
+        _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // GET /feed/{username}
+    // GET /users/{username}/feed
     // Gets a user's feed.
-    ["feed", username] -> {
+    ["users", username, "feed"] -> {
       use <- wisp.require_method(req, Get)
       let result =
         process.call(engine_inbox, 1000, fn(r) { GetFeed(username, r) })
@@ -229,159 +223,147 @@ pub fn handle_request(
           wisp.json_response(posts_to_json(posts), 200)
         }
 
-        Error(msg) -> wisp.not_found() |> wisp.html_body(msg)
+        Error(msg) ->
+          wisp.json_response(
+            json.to_string(json.object([#("error", json.string(msg))])),
+            404,
+          )
       }
     }
 
-    // POST /join/subreddit
-    // Joins a subreddit.
-    // Body: "username", "subreddit"
-    ["join", "subreddit"] -> {
-      use <- wisp.require_method(req, Post)
-      use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit {
-        "", _ -> wisp.bad_request("Invalid username")
-        _, "" -> wisp.bad_request("Invalid subreddit")
-        _, _ -> {
+    // PUT/DELETE /users/{username}/subscriptions/{subreddit_id}
+    // Joins or leaves a subreddit.
+    ["users", username, "subscriptions", subreddit_id] -> {
+      case req.method {
+        Put -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
-              JoinSubreddit(username, subreddit, r)
+              JoinSubreddit(username, subreddit_id, r)
             })
           case result {
-            True -> wisp.ok() |> wisp.html_body("Joined subreddit successfully")
-            False ->
-              wisp.response(409) |> wisp.html_body("Failed to join subreddit")
+            Ok(msg) ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("message", json.string(msg)),
+                  ]),
+                ),
+                200,
+              )
+            Error(err) ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("error", json.string(err)),
+                  ]),
+                ),
+                400,
+              )
           }
         }
-      }
-    }
-
-    // POST /leave/subreddit
-    // Leaves a subreddit.
-    // Body: "username", "subreddit"
-    ["leave", "subreddit"] -> {
-      use <- wisp.require_method(req, Post)
-      use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit {
-        "", _ -> wisp.bad_request("Invalid username")
-        _, "" -> wisp.bad_request("Invalid subreddit")
-        _, _ -> {
+        Delete -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
-              LeaveSubreddit(username, subreddit, r)
+              LeaveSubreddit(username, subreddit_id, r)
             })
           case result {
-            True -> wisp.ok() |> wisp.html_body("Left subreddit successfully")
-            False ->
-              wisp.response(409) |> wisp.html_body("Failed to leave subreddit")
+            Ok(msg) ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("message", json.string(msg)),
+                  ]),
+                ),
+                200,
+              )
+            Error(err) ->
+              wisp.json_response(
+                json.to_string(
+                  json.object([
+                    #("error", json.string(err)),
+                  ]),
+                ),
+                400,
+              )
           }
         }
+        _ -> wisp.method_not_allowed([Put, Delete])
       }
     }
 
-    // POST /comment/post
+    // POST /subreddits/{subreddit_id}/posts/{post_id}/comments
     // Comments on a post.
-    // Body: "username", "subreddit", "post_id", "content"
-    ["comment", "post"] -> {
+    // Body: "username", "content"
+    ["subreddits", subreddit_id, "posts", post_id_str, "comments"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let post_id = case list.key_find(formdata.values, "post_id") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let content = case list.key_find(formdata.values, "content") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit, post_id, content {
-        "", _, _, _ -> wisp.bad_request("Invalid username")
-        _, "", _, _ -> wisp.bad_request("Invalid subreddit")
-        _, _, "", _ -> wisp.bad_request("Invalid post_id")
-        _, _, _, "" -> wisp.bad_request("Invalid content")
-        _, _, _, _ -> {
-          case bit_array.base64_decode(post_id) {
-            Ok(b) -> {
-              let post_id_b = models.Uuid(value: b)
-              let result =
-                process.call(engine_inbox, 1000, fn(r) {
-                  CommentOnPost(username, subreddit, post_id_b, content, r)
-                })
-              case result {
-                True ->
-                  wisp.ok() |> wisp.html_body("Commented on post successfully")
-                False ->
-                  wisp.response(409)
-                  |> wisp.html_body("Failed to comment on post")
+      case get_form_params(formdata, ["username", "content"]) {
+        Ok([username, content]) -> {
+          case uri.percent_decode(post_id_str) {
+            Ok(post_id_str) -> {
+              case bit_array.base64_decode(post_id_str) {
+                Ok(b) -> {
+                  let post_id_b = models.Uuid(value: b)
+                  let result =
+                    process.call(engine_inbox, 1000, fn(r) {
+                      CommentOnPost(
+                        username,
+                        subreddit_id,
+                        post_id_b,
+                        content,
+                        r,
+                      )
+                    })
+                  case result {
+                    Ok(msg) ->
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([
+                            #("message", json.string(msg)),
+                          ]),
+                        ),
+                        201,
+                      )
+                    Error(err) ->
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([
+                            #("error", json.string(err)),
+                          ]),
+                        ),
+                        400,
+                      )
+                  }
+                }
+                Error(_) -> wisp.bad_request("Invalid post_id")
               }
             }
+
             Error(_) -> wisp.bad_request("Invalid post_id")
           }
         }
+        _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // POST /comment/comment
+    // POST /comments/{parent_comment_id}/replies
     // Replies to a comment.
-    // Body: "username", "subreddit", "post_id", "parent_comment_id", "content"
-    ["comment", "comment"] -> {
+    // Body: "username", "subreddit", "post_id", "content"
+    ["comments", parent_comment_id_str, "replies"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let post_id = case list.key_find(formdata.values, "post_id") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let parent_comment_id = case
-        list.key_find(formdata.values, "parent_comment_id")
+      case
+        get_form_params(formdata, [
+          "username",
+          "subreddit",
+          "post_id",
+          "content",
+        ])
       {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let content = case list.key_find(formdata.values, "content") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit, post_id, parent_comment_id, content {
-        "", _, _, _, _ -> wisp.bad_request("Invalid username")
-        _, "", _, _, _ -> wisp.bad_request("Invalid subreddit")
-        _, _, "", _, _ -> wisp.bad_request("Invalid post_id")
-        _, _, _, "", _ -> wisp.bad_request("Invalid parent_comment_id")
-        _, _, _, _, "" -> wisp.bad_request("Invalid content")
-        _, _, _, _, _ -> {
+        Ok([username, subreddit, post_id_str, content]) -> {
           case
-            bit_array.base64_decode(post_id),
-            bit_array.base64_decode(parent_comment_id)
+            bit_array.base64_decode(post_id_str),
+            bit_array.base64_decode(parent_comment_id_str)
           {
             Ok(a), Ok(b) -> {
               let post_id_b = models.Uuid(value: a)
@@ -399,12 +381,24 @@ pub fn handle_request(
                   )
                 })
               case result {
-                True ->
-                  wisp.ok()
-                  |> wisp.html_body("Commented on comment successfully")
-                False ->
-                  wisp.response(409)
-                  |> wisp.html_body("Failed to comment on comment")
+                Ok(msg) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("message", json.string(msg)),
+                      ]),
+                    ),
+                    201,
+                  )
+                Error(err) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("error", json.string(err)),
+                      ]),
+                    ),
+                    400,
+                  )
               }
             }
 
@@ -416,198 +410,253 @@ pub fn handle_request(
               wisp.bad_request("Invalid parent_comment_id and post_id")
           }
         }
+        _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // POST /vote
+    // POST /posts/{post_id}/votes
     // Votes on a post.
-    // Body: "username", "subreddit", "post_id", "vote" ("upvote" or "downvote")
-    ["vote"] -> {
+    // Body: "username", "subreddit", "vote" ("upvote" or "downvote")
+    ["posts", post_id_str, "votes"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let post_id = case list.key_find(formdata.values, "post_id") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let vote = case list.key_find(formdata.values, "vote") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit, post_id, vote {
-        "", _, _, _ -> wisp.bad_request("Invalid username")
-        _, "", _, _ -> wisp.bad_request("Invalid subreddit")
-        _, _, "", _ -> wisp.bad_request("Invalid post_id")
-        _, _, _, "" -> wisp.bad_request("Invalid vote")
-        _, _, _, _ -> {
+      let username_r = list.key_find(formdata.values, "username")
+      let subreddit_r = list.key_find(formdata.values, "subreddit")
+      let vote_r = list.key_find(formdata.values, "vote")
+      case username_r, subreddit_r, vote_r {
+        Ok(username), Ok(subreddit), Ok(vote) -> {
           let vote_type = case vote {
             "upvote" -> Upvote
             "downvote" -> Downvote
             _ -> Upvote
           }
-          case bit_array.base64_decode(post_id) {
-            Ok(d) -> {
-              let post_id_b = models.Uuid(value: d)
-
-              let result =
-                process.call(engine_inbox, 1000, fn(r) {
-                  VotePost(subreddit, username, post_id_b, vote_type, r)
-                })
-              case result {
-                True -> wisp.ok() |> wisp.html_body("Voted successfully")
-                False -> wisp.response(409) |> wisp.html_body("Failed to vote")
+          case uri.percent_decode(post_id_str) {
+            Ok(post_id_str) -> {
+              case bit_array.base64_decode(post_id_str) {
+                Ok(d) -> {
+                  let post_id_b = models.Uuid(value: d)
+                  let result =
+                    process.call(engine_inbox, 1000, fn(r) {
+                      VotePost(subreddit, username, post_id_b, vote_type, r)
+                    })
+                  case result {
+                    Ok(msg) ->
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([
+                            #("message", json.string(msg)),
+                          ]),
+                        ),
+                        200,
+                      )
+                    Error(err) ->
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([#("error", json.string(err))]),
+                        ),
+                        400,
+                      )
+                  }
+                }
+                Error(_) -> {
+                  echo post_id_str
+                  wisp.bad_request("Invalid post id")
+                }
               }
             }
+
             Error(_) -> wisp.bad_request("Invalid post id")
           }
         }
+        _, _, _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // POST /dm
+    // POST /dms
     // Sends a direct message.
     // Body: "from", "to", "content"
-    ["dm"] -> {
+    ["dms"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
-      let from = case list.key_find(formdata.values, "from") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let to = case list.key_find(formdata.values, "to") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let content = case list.key_find(formdata.values, "content") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case from, to, content {
-        "", _, _ -> wisp.bad_request("Invalid from")
-        _, "", _ -> wisp.bad_request("Invalid to")
-        _, _, "" -> wisp.bad_request("Invalid content")
-        _, _, _ -> {
+      case get_form_params(formdata, ["from", "to", "content"]) {
+        Ok([from, to, content]) -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
               SendDirectMessage(from, to, content, r)
             })
           case result {
-            True -> wisp.ok() |> wisp.html_body("Sent DM successfully")
-            False -> wisp.response(409) |> wisp.html_body("Failed to send DM")
+            Ok(msg) -> wisp.ok() |> wisp.html_body(msg)
+            Error(err) -> wisp.response(400) |> wisp.html_body(err)
           }
         }
+        _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // POST /create/post
+    // POST /subreddits/{subreddit_id}/posts
     // Creates a new post.
-    // Body: "username", "subreddit", "title", "content"
-    ["create", "post"] -> {
+    // Body: "username", "title", "content"
+    ["subreddits", subreddit_id, "posts"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
-      let username = case list.key_find(formdata.values, "username") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let subreddit = case list.key_find(formdata.values, "subreddit") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let title = case list.key_find(formdata.values, "title") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      let content = case list.key_find(formdata.values, "content") {
-        Error(_) -> ""
-        Ok(d) -> d
-      }
-      case username, subreddit, title, content {
-        "", _, _, _ -> wisp.bad_request("Invalid username")
-        _, "", _, _ -> wisp.bad_request("Invalid subreddit")
-        _, _, "", _ -> wisp.bad_request("Invalid title")
-        _, _, _, "" -> wisp.bad_request("Invalid content")
-        _, _, _, _ -> {
+      case get_form_params(formdata, ["username", "title", "content"]) {
+        Ok([username, title, content]) -> {
           let post_id =
             process.call(engine_inbox, 1000, fn(r) {
               CreatePostWithReply(
                 username: username,
-                subreddit_id: subreddit,
+                subreddit_id: subreddit_id,
                 title: title,
                 content: content,
                 reply_to: r,
               )
             })
-          let models.Uuid(value: post_id_bits) = post_id
-          let post_id_string = bit_array.base64_encode(post_id_bits, True)
-          wisp.response(201)
-          |> wisp.html_body(post_id_string)
+          case post_id {
+            Ok(id) -> {
+              let models.Uuid(value: post_id_bits) = id
+              let post_id_string = bit_array.base64_encode(post_id_bits, True)
+              wisp.json_response(
+                json.to_string(
+                  json.object([#("post_id", json.string(post_id_string))]),
+                ),
+                201,
+              )
+            }
+            Error(err) ->
+              wisp.json_response(
+                json.to_string(json.object([#("error", json.string(err))])),
+                400,
+              )
+          }
         }
+        _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
-    // GET /dms/{username}
+    // GET /users/{username}/dms
     // Gets a user's direct messages.
-    ["dms", username] -> {
+    ["users", username, "dms"] -> {
       use <- wisp.require_method(req, Get)
-      let dms =
+      let dms_result =
         process.call(engine_inbox, 1000, fn(r) {
           GetDirectMessages(username, r)
         })
 
-      let dms_to_json = fn(dms: List(DirectMessage)) -> String {
-        json.object([
-          #(
-            "dms",
-            json.array(
-              list.map(dms, fn(dm) {
-                [
-                  #("from", json.string(dm.from)),
-                  #("to", json.string(dm.to)),
-                  #("content", json.string(dm.content)),
-                  #(
-                    "timestamp",
-                    json.float(dm.timestamp |> timestamp.to_unix_seconds),
-                  ),
-                ]
-              }),
-              of: json.object,
-            ),
-          ),
-        ])
-        |> json.to_string
+      case dms_result {
+        Ok(dms) -> {
+          let dms_to_json = fn(dms: List(DirectMessage)) -> String {
+            json.object([
+              #(
+                "dms",
+                json.array(
+                  list.map(dms, fn(dm) {
+                    [
+                      #("from", json.string(dm.from)),
+                      #("to", json.string(dm.to)),
+                      #("content", json.string(dm.content)),
+                      #(
+                        "timestamp",
+                        json.float(dm.timestamp |> timestamp.to_unix_seconds),
+                      ),
+                    ]
+                  }),
+                  of: json.object,
+                ),
+              ),
+            ])
+            |> json.to_string
+          }
+          wisp.json_response(dms_to_json(dms), 200)
+        }
+        Error(err) ->
+          wisp.json_response(
+            json.to_string(json.object([#("error", json.string(err))])),
+            400,
+          )
       }
-      wisp.json_response(dms_to_json(dms), 200)
     }
 
-    // GET /karma/{username}
+    // GET /users/{username}/karma
     // Gets a user's karma.
-    ["karma", username] -> {
+    ["users", username, "karma"] -> {
       use <- wisp.require_method(req, Get)
-      let karma =
+      let karma_result =
         process.call(engine_inbox, 1000, fn(r) {
           GetKarma("api_user", username, r)
         })
 
-      wisp.ok() |> wisp.html_body(int.to_string(karma))
+      case karma_result {
+        Ok(karma) ->
+          wisp.json_response(
+            json.to_string(json.object([#("karma", json.int(karma))])),
+            200,
+          )
+        Error(err) ->
+          wisp.json_response(
+            json.to_string(json.object([#("error", json.string(err))])),
+            400,
+          )
+      }
     }
 
-    // GET /subreddit/members/{subreddit_id}
+    // GET /search/usernames?q={query}
+    // Searches for users containing query string.
+    ["search", "usernames"] -> {
+      use <- wisp.require_method(req, Get)
+      case list.key_find(wisp.get_query(req), "q") {
+        Ok(query) -> {
+          let users =
+            process.call(engine_inbox, 1000, fn(r) { SearchUsers(query, r) })
+
+          wisp.json_response(
+            json.to_string(json.array(users, of: json.string)),
+            200,
+          )
+        }
+
+        Error(_) -> wisp.bad_request("Missing query parameter")
+      }
+    }
+
+    // GET /search/subreddits?q={query}
+    // Searches for subreddits containing query string.
+    ["search", "subreddits"] -> {
+      use <- wisp.require_method(req, Get)
+      case list.key_find(wisp.get_query(req), "q") {
+        Ok(query) -> {
+          let subreddits =
+            process.call(engine_inbox, 1000, fn(r) {
+              SearchSubreddits(query, r)
+            })
+          wisp.json_response(
+            json.array(subreddits, of: fn(tup: #(SubredditId, String)) {
+              json.object([
+                #("name", json.string(tup.0)),
+                #("description", json.string(tup.1)),
+              ])
+            })
+              |> json.to_string,
+            200,
+          )
+        }
+
+        Error(_) -> wisp.bad_request("Missing query parameter")
+      }
+    }
+
+    // GET /subreddits/{subreddit_id}/members
     // Gets the member count of a subreddit.
-    ["subreddit", "members", subreddit_id] -> {
+    ["subreddits", subreddit_id, "members"] -> {
       use <- wisp.require_method(req, Get)
       let count =
         process.call(engine_inbox, 1000, fn(r) {
           GetSubredditMemberCount(subreddit_id, r)
         })
 
-      wisp.ok() |> wisp.html_body(int.to_string(count))
+      wisp.json_response(
+        json.to_string(json.object([#("member_count", json.int(count))])),
+        200,
+      )
     }
 
     // GET /metrics
@@ -658,33 +707,34 @@ pub type EngineState {
 pub type EngineMessage {
   UserRegister(username: Username, reply_to: process.Subject(Bool))
   CreateSubreddit(
+    username: Username,
     name: SubredditId,
     description: String,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   JoinSubreddit(
     username: Username,
     subreddit_name: SubredditId,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   LeaveSubreddit(
     username: Username,
     subreddit_name: SubredditId,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   CreatePostWithReply(
     username: Username,
     subreddit_id: SubredditId,
     content: String,
     title: String,
-    reply_to: process.Subject(PostId),
+    reply_to: process.Subject(Result(PostId, String)),
   )
   CommentOnPost(
     username: Username,
     subreddit_id: SubredditId,
     post_id: PostId,
     content: String,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   CommentOnComment(
     username: Username,
@@ -692,14 +742,14 @@ pub type EngineMessage {
     post_id: PostId,
     parent_comment_id: CommentId,
     content: String,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   VotePost(
     subreddit_id: SubredditId,
     username: Username,
     post_id: PostId,
     vote: VoteType,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   GetFeed(
     username: Username,
@@ -707,18 +757,18 @@ pub type EngineMessage {
   )
   GetDirectMessages(
     username: Username,
-    reply_to: process.Subject(List(DirectMessage)),
+    reply_to: process.Subject(Result(List(DirectMessage), String)),
   )
   SendDirectMessage(
     from_username: Username,
     to_username: Username,
     content: String,
-    reply_to: process.Subject(Bool),
+    reply_to: process.Subject(Result(String, String)),
   )
   GetKarma(
     sender_username: Username,
     username: Username,
-    reply_to: process.Subject(Int),
+    reply_to: process.Subject(Result(Int, String)),
   )
   GetSubredditMemberCount(
     subreddit_id: SubredditId,
@@ -726,6 +776,11 @@ pub type EngineMessage {
   )
   GetEngineMetrics(reply_to: process.Subject(PerformanceMetrics))
   RefreshEngineMetrics
+  SearchUsers(query: String, reply_to: process.Subject(List(Username)))
+  SearchSubreddits(
+    query: String,
+    reply_to: process.Subject(List(#(SubredditId, String))),
+  )
 }
 
 pub fn engine_message_handler(
@@ -736,8 +791,14 @@ pub fn engine_message_handler(
   case message {
     UserRegister(username:, reply_to:) ->
       actor.continue(register_user(state, username, reply_to))
-    CreateSubreddit(name:, description:, reply_to:) ->
-      actor.continue(create_subreddit(state, name, description, reply_to))
+    CreateSubreddit(username:, name:, description:, reply_to:) ->
+      actor.continue(create_subreddit(
+        state,
+        username,
+        name,
+        description,
+        reply_to,
+      ))
     JoinSubreddit(username:, subreddit_name:, reply_to:) ->
       actor.continue(join_subreddit(state, username, subreddit_name, reply_to))
     LeaveSubreddit(username:, subreddit_name:, reply_to:) ->
@@ -810,14 +871,52 @@ pub fn engine_message_handler(
     GetEngineMetrics(reply_to:) ->
       actor.continue(get_engine_metrics(state, reply_to))
     RefreshEngineMetrics -> actor.continue(refresh_engine_metrics(state))
+    SearchSubreddits(query:, reply_to:) ->
+      actor.continue(search_subreddits(state, query, reply_to))
+    SearchUsers(query:, reply_to:) ->
+      actor.continue(search_users(state, query, reply_to))
   }
+}
+
+pub fn search_subreddits(
+  state: EngineState,
+  query: String,
+  reply_to: process.Subject(List(#(SubredditId, String))),
+) -> EngineState {
+  printi("Searching subreddits for query: " <> query)
+  // Perform search and retrieve matching subreddits
+  let results =
+    dict.filter(state.subreddits, fn(_, subreddit) {
+      string.contains(subreddit.name, query)
+    })
+    |> dict.to_list()
+    |> list.map(fn(t) { #(t.0, { t.1 }.description) })
+  process.send(reply_to, results)
+  state
+}
+
+pub fn search_users(
+  state: EngineState,
+  query: String,
+  reply_to: process.Subject(List(Username)),
+) -> EngineState {
+  printi("Searching users for query: " <> query)
+  // Perform search and retrieve matching users
+  let results =
+    dict.filter(state.users, fn(username, _) {
+      string.contains(username, query)
+    })
+    |> dict.to_list()
+    |> list.map(fn(t) { t.0 })
+  process.send(reply_to, results)
+  state
 }
 
 pub fn refresh_engine_metrics(state: EngineState) -> EngineState {
   let simulation_checkpoint_time = timestamp.system_time()
   // Update metrics timestamps
   let updated_metrics =
-    PerformanceMetrics(
+    models.PerformanceMetrics(
       ..state.metrics,
       simulation_checkpoint_time: simulation_checkpoint_time,
       posts_per_second: int.to_float(state.metrics.total_posts)
@@ -865,26 +964,34 @@ pub fn get_karma(
   state: EngineState,
   sender_username: Username,
   username: Username,
-  reply_to: process.Subject(Int),
+  reply_to: process.Subject(Result(Int, String)),
 ) -> EngineState {
   printi(sender_username <> " is requesting karma for " <> username)
-  // Retrieve user's upvotes and downvotes
-  let user_upvotes =
-    case dict.get(state.users, username) {
-      Ok(user) -> user.upvotes
-      Error(_) -> 0
+
+  case dict.has_key(state.users, sender_username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
     }
-    |> int.to_float
-  let user_downvotes =
-    case dict.get(state.users, username) {
-      Ok(user) -> user.downvotes
-      Error(_) -> 0
+    True -> {
+      // Retrieve user's upvotes and downvotes
+      case dict.get(state.users, username) {
+        Ok(user) -> {
+          let user_upvotes = int.to_float(user.upvotes)
+          let user_downvotes = int.to_float(user.downvotes)
+          // Calculate karma based on upvotes and downvotes
+          let karma =
+            user_upvotes *. 1.2 -. user_downvotes *. 0.7 |> float.round
+          process.send(reply_to, Ok(karma))
+          state
+        }
+        Error(_) -> {
+          process.send(reply_to, Error("User not found"))
+          state
+        }
+      }
     }
-    |> int.to_float
-  // Calculate karma based on upvotes and downvotes
-  let karma = user_upvotes *. 1.2 -. user_downvotes *. 0.7 |> float.round
-  process.send(reply_to, karma)
-  state
+  }
 }
 
 pub fn vote_post(
@@ -893,97 +1000,112 @@ pub fn vote_post(
   subreddit_id: SubredditId,
   post_id: PostId,
   vote: VoteType,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
   printi(username <> " is voting in r/" <> subreddit_id)
 
-  // Check if subreddit exists
-  case dict.get(state.subreddits, subreddit_id) {
-    Error(_) -> {
-      printi("⚠ Subreddit r/" <> subreddit_id <> " not found for voting")
-      process.send(reply_to, False)
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
       state
     }
-    Ok(subreddit) -> {
-      // Find the post to vote on
-      let post_opt = list.find(subreddit.posts, fn(post) { post.id == post_id })
-
-      case post_opt {
+    True -> {
+      // Check if subreddit exists
+      case dict.get(state.subreddits, subreddit_id) {
         Error(_) -> {
-          printi("⚠ Post not found in r/" <> subreddit_id <> " for voting")
-          process.send(reply_to, False)
+          printi("⚠ Subreddit r/" <> subreddit_id <> " not found for voting")
+          process.send(reply_to, Error("Subreddit not found"))
           state
         }
-        Ok(found_post) -> {
-          // Update the post's upvote/downvote count in the subreddit
-          let updated_subreddits =
-            dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
-              case sub_op {
-                Some(subreddit) -> {
-                  let updated_posts =
-                    list.map(subreddit.posts, fn(post) {
-                      case post.id == post_id {
-                        True ->
-                          case vote {
-                            Upvote ->
-                              models.Post(..post, upvote: post.upvote + 1)
-                            Downvote ->
-                              models.Post(..post, downvote: post.downvote + 1)
-                          }
-                        False -> post
-                      }
-                    })
-                  models.Subreddit(..subreddit, posts: updated_posts)
-                }
-                None -> subreddit
-              }
-            })
+        Ok(subreddit) -> {
+          // Find the post to vote on
+          let post_opt =
+            list.find(subreddit.posts, fn(post) { post.id == post_id })
 
-          // Update the author's karma (upvote/downvote count)
-          let updated_users = case dict.get(state.users, found_post.author) {
-            Ok(_) -> {
-              dict.upsert(state.users, found_post.author, fn(user_op) {
-                case user_op {
-                  Some(user) ->
-                    case vote {
-                      Upvote -> models.User(..user, upvotes: user.upvotes + 1)
-                      Downvote ->
-                        models.User(..user, downvotes: user.downvotes + 1)
-                    }
-                  None ->
-                    user_op
-                    |> option.unwrap(
-                      models.User(
-                        username: found_post.author,
-                        upvotes: 0,
-                        downvotes: 0,
-                        subscribed_subreddits: set.new(),
-                        inbox: [],
-                      ),
-                    )
-                }
-              })
-            }
+          case post_opt {
             Error(_) -> {
-              printi("⚠ Post author " <> found_post.author <> " not found")
-              state.users
+              printi("⚠ Post not found in r/" <> subreddit_id <> " for voting")
+              process.send(reply_to, Error("Post not found"))
+              state
+            }
+            Ok(found_post) -> {
+              // Update the post's upvote/downvote count in the subreddit
+              let updated_subreddits =
+                dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
+                  case sub_op {
+                    Some(subreddit) -> {
+                      let updated_posts =
+                        list.map(subreddit.posts, fn(post) {
+                          case post.id == post_id {
+                            True ->
+                              case vote {
+                                Upvote ->
+                                  models.Post(..post, upvote: post.upvote + 1)
+                                Downvote ->
+                                  models.Post(
+                                    ..post,
+                                    downvote: post.downvote + 1,
+                                  )
+                              }
+                            False -> post
+                          }
+                        })
+                      models.Subreddit(..subreddit, posts: updated_posts)
+                    }
+                    None -> subreddit
+                  }
+                })
+
+              // Update the author's karma (upvote/downvote count)
+              let updated_users = case
+                dict.get(state.users, found_post.author)
+              {
+                Ok(_) -> {
+                  dict.upsert(state.users, found_post.author, fn(user_op) {
+                    case user_op {
+                      Some(user) ->
+                        case vote {
+                          Upvote ->
+                            models.User(..user, upvotes: user.upvotes + 1)
+                          Downvote ->
+                            models.User(..user, downvotes: user.downvotes + 1)
+                        }
+                      None ->
+                        user_op
+                        |> option.unwrap(
+                          models.User(
+                            username: found_post.author,
+                            upvotes: 0,
+                            downvotes: 0,
+                            subscribed_subreddits: set.new(),
+                            inbox: [],
+                          ),
+                        )
+                    }
+                  })
+                }
+                Error(_) -> {
+                  printi("⚠ Post author " <> found_post.author <> " not found")
+                  state.users
+                }
+              }
+              process.send(reply_to, Ok("Voted successfully"))
+              EngineState(
+                ..state,
+                subreddits: updated_subreddits,
+                users: updated_users,
+                metrics: models.PerformanceMetrics(
+                  ..state.metrics,
+                  total_votes: state.metrics.total_votes
+                    + bool.lazy_guard(
+                      when: updated_subreddits == state.subreddits,
+                      return: fn() { 0 },
+                      otherwise: fn() { 1 },
+                    ),
+                ),
+              )
             }
           }
-          process.send(reply_to, True)
-          EngineState(
-            ..state,
-            subreddits: updated_subreddits,
-            users: updated_users,
-            metrics: PerformanceMetrics(
-              ..state.metrics,
-              total_votes: state.metrics.total_votes
-                + bool.lazy_guard(
-                  when: updated_subreddits == state.subreddits,
-                  return: fn() { 0 },
-                  otherwise: fn() { 1 },
-                ),
-            ),
-          )
         }
       }
     }
@@ -996,62 +1118,72 @@ pub fn create_post_with_reply(
   subreddit_id: SubredditId,
   content: String,
   title: String,
-  reply_to: process.Subject(PostId),
+  reply_to: process.Subject(Result(PostId, String)),
 ) -> EngineState {
   printi(username <> " is creating post in r/" <> subreddit_id)
 
-  // Generate a unique ID and create the new post
-  let new_post =
-    models.Post(
-      id: models.uuid_gen(),
-      title: title,
-      content: content,
-      author: username,
-      comments: dict.new(),
-      upvote: 0,
-      downvote: 0,
-      timestamp: timestamp.system_time(),
-    )
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
+    }
+    True -> {
+      // Generate a unique ID and create the new post
+      let new_post =
+        models.Post(
+          id: models.uuid_gen(),
+          title: title,
+          content: content,
+          author: username,
+          comments: dict.new(),
+          upvote: 0,
+          downvote: 0,
+          timestamp: timestamp.system_time(),
+        )
 
-  // Send the post_id back to the requester
-  process.send(reply_to, new_post.id)
+      // Send the post_id back to the requester
+      process.send(reply_to, Ok(new_post.id))
 
-  // Add the post to the subreddit
-  let updated_subreddits =
-    dict.upsert(state.subreddits, subreddit_id, fn(subreddit_op) {
-      case subreddit_op {
-        Some(subreddit) ->
-          models.Subreddit(
-            ..subreddit,
-            posts: list.prepend(subreddit.posts, new_post),
-          )
-        None -> {
-          printi(
-            "⚠ Subreddit r/" <> subreddit_id <> " not found for post creation",
-          )
-          models.Subreddit(
-            name: subreddit_id,
-            description: "",
-            subscribers: set.new(),
-            posts: [new_post],
-          )
-        }
-      }
-    })
+      // Add the post to the subreddit
+      let updated_subreddits =
+        dict.upsert(state.subreddits, subreddit_id, fn(subreddit_op) {
+          case subreddit_op {
+            Some(subreddit) ->
+              models.Subreddit(
+                ..subreddit,
+                posts: list.prepend(subreddit.posts, new_post),
+              )
+            None -> {
+              printi(
+                "⚠ Subreddit r/"
+                <> subreddit_id
+                <> " not found for post creation",
+              )
+              models.Subreddit(
+                name: subreddit_id,
+                description: "",
+                subscribers: set.new(),
+                posts: [new_post],
+              )
+            }
+          }
+        })
 
-  EngineState(
-    ..state,
-    subreddits: updated_subreddits,
-    metrics: PerformanceMetrics(
-      ..state.metrics,
-      total_posts: state.metrics.total_posts
-        + bool.lazy_guard(
-          when: updated_subreddits == state.subreddits,
-          return: fn() { 0 },
-          otherwise: fn() { 1 },
+      EngineState(
+        ..state,
+        subreddits: updated_subreddits,
+        metrics: models.PerformanceMetrics(
+          ..state.metrics,
+          total_posts: state.metrics.total_posts
+            + bool.lazy_guard(
+              when: updated_subreddits == state.subreddits,
+              return: fn() { 0 },
+              otherwise: fn() { 1 },
+            ),
         ),
-    ),
-  )
+      )
+    }
+  }
 }
 
 pub fn send_direct_message(
@@ -1059,69 +1191,81 @@ pub fn send_direct_message(
   from_username: Username,
   to_username: Username,
   content: String,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
   printi(from_username <> " is sending DM to " <> to_username)
 
-  // Create the message with timestamp
-  let new_message =
-    models.DirectMessage(
-      from: from_username,
-      to: to_username,
-      content: content,
-      timestamp: timestamp.system_time(),
-    )
-
-  // Add message to recipient's inbox
-  let updated_users = case dict.get(state.users, to_username) {
-    Ok(_) -> {
-      dict.upsert(state.users, to_username, fn(user_op) {
-        let assert Some(user) = user_op
-        models.User(..user, inbox: list.prepend(user.inbox, new_message))
-      })
+  case dict.has_key(state.users, from_username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
     }
-    Error(_) -> {
-      printi("⚠ Recipient user " <> to_username <> " not found")
-      state.users
+    True -> {
+      // Create the message with timestamp
+      let new_message =
+        models.DirectMessage(
+          from: from_username,
+          to: to_username,
+          content: content,
+          timestamp: timestamp.system_time(),
+        )
+
+      // Add message to recipient's inbox
+      let updated_users = case dict.get(state.users, to_username) {
+        Ok(_) -> {
+          dict.upsert(state.users, to_username, fn(user_op) {
+            let assert Some(user) = user_op
+            models.User(..user, inbox: list.prepend(user.inbox, new_message))
+          })
+        }
+        Error(_) -> {
+          printi("⚠ Recipient user " <> to_username <> " not found")
+          state.users
+        }
+      }
+
+      let success = updated_users != state.users
+      case success {
+        True -> process.send(reply_to, Ok("Sent DM successfully"))
+        False -> process.send(reply_to, Error("Recipient not found"))
+      }
+
+      EngineState(
+        ..state,
+        users: updated_users,
+        metrics: models.PerformanceMetrics(
+          ..state.metrics,
+          total_messages: state.metrics.total_messages
+            + bool.lazy_guard(
+              when: success,
+              return: fn() { 1 },
+              otherwise: fn() { 0 },
+            ),
+        ),
+      )
     }
   }
-
-  let success = updated_users != state.users
-  process.send(reply_to, success)
-
-  EngineState(
-    ..state,
-    users: updated_users,
-    metrics: PerformanceMetrics(
-      ..state.metrics,
-      total_messages: state.metrics.total_messages
-        + bool.lazy_guard(when: success, return: fn() { 1 }, otherwise: fn() {
-          0
-        }),
-    ),
-  )
 }
 
 pub fn get_direct_messages(
   state: EngineState,
   username: Username,
-  reply_to: process.Subject(List(DirectMessage)),
+  reply_to: process.Subject(Result(List(DirectMessage), String)),
 ) -> EngineState {
   printi(username <> " is fetching their direct messages")
 
   // Retrieve user's inbox
-  let user_inbox = case dict.get(state.users, username) {
-    Ok(user) -> user.inbox
+  case dict.get(state.users, username) {
+    Ok(user) -> {
+      actor.send(reply_to, Ok(user.inbox))
+      state
+    }
     Error(_) -> {
       printi("⚠ User " <> username <> " not found for fetching messages")
-      []
+      actor.send(reply_to, Error("Invalid user"))
+      state
     }
   }
-
-  // Send inbox to the requesting subject
-  actor.send(reply_to, user_inbox)
-
-  state
 }
 
 pub fn get_feed(
@@ -1171,37 +1315,136 @@ pub fn comment_on_comment(
   post_id: PostId,
   parent_comment_id: CommentId,
   content: String,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
   printi(username <> " is replying to a comment in r/" <> subreddit_id)
 
-  // Create nested comment with parent reference
-  let new_comment =
-    models.Comment(
-      id: models.uuid_gen(),
-      author: username,
-      content: content,
-      timestamp: timestamp.system_time(),
-      upvote: 0,
-      downvote: 0,
-      parent_id: Some(parent_comment_id),
-    )
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
+    }
+    True -> {
+      // Create nested comment with parent reference
+      let new_comment =
+        models.Comment(
+          id: models.uuid_gen(),
+          author: username,
+          content: content,
+          timestamp: timestamp.system_time(),
+          upvote: 0,
+          downvote: 0,
+          parent_id: Some(parent_comment_id),
+        )
 
-  // Add comment to the post in the subreddit
-  let updated_subreddits =
-    dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
-      case sub_op {
-        Some(subreddit) -> {
-          let updated_posts =
-            list.map(subreddit.posts, fn(post) {
-              case post.id == post_id {
-                False -> post
-                True -> {
-                  case dict.has_key(post.comments, parent_comment_id) {
-                    False -> {
-                      printi("⚠ Parent comment not found in post")
-                      post
+      // Add comment to the post in the subreddit
+      let updated_subreddits =
+        dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
+          case sub_op {
+            Some(subreddit) -> {
+              let updated_posts =
+                list.map(subreddit.posts, fn(post) {
+                  case post.id == post_id {
+                    False -> post
+                    True -> {
+                      case dict.has_key(post.comments, parent_comment_id) {
+                        False -> {
+                          printi("⚠ Parent comment not found in post")
+                          post
+                        }
+                        True ->
+                          models.Post(
+                            ..post,
+                            comments: dict.insert(
+                              post.comments,
+                              new_comment.id,
+                              new_comment,
+                            ),
+                          )
+                      }
                     }
+                  }
+                })
+              models.Subreddit(..subreddit, posts: updated_posts)
+            }
+
+            None -> {
+              printi(
+                "⚠ Subreddit r/" <> subreddit_id <> " not found for commenting",
+              )
+              sub_op
+              |> option.unwrap(
+                models.Subreddit(
+                  name: subreddit_id,
+                  description: "",
+                  subscribers: set.new(),
+                  posts: [],
+                ),
+              )
+            }
+          }
+        })
+
+      let success = updated_subreddits != state.subreddits
+      case success {
+        True -> process.send(reply_to, Ok("Commented on comment successfully"))
+        False -> process.send(reply_to, Error("Failed to comment on comment"))
+      }
+
+      EngineState(
+        ..state,
+        subreddits: updated_subreddits,
+        metrics: models.PerformanceMetrics(
+          ..state.metrics,
+          total_comments: state.metrics.total_comments
+            + bool.lazy_guard(
+              when: success,
+              return: fn() { 1 },
+              otherwise: fn() { 0 },
+            ),
+        ),
+      )
+    }
+  }
+}
+
+pub fn comment_on_post(
+  state: EngineState,
+  username: Username,
+  subreddit_id: SubredditId,
+  post_id: PostId,
+  content: String,
+  reply_to: process.Subject(Result(String, String)),
+) -> EngineState {
+  printi(username <> " is commenting on a post in r/" <> subreddit_id)
+
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
+    }
+    True -> {
+      // Create top-level comment (no parent)
+      let new_comment =
+        models.Comment(
+          id: models.uuid_gen(),
+          author: username,
+          content: content,
+          timestamp: timestamp.system_time(),
+          upvote: 0,
+          downvote: 0,
+          parent_id: None,
+        )
+
+      // Add comment to the post
+      let updated_subreddits =
+        dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
+          case sub_op {
+            Some(subreddit) -> {
+              let updated_posts =
+                list.map(subreddit.posts, fn(post) {
+                  case post.id == post_id {
+                    False -> post
                     True ->
                       models.Post(
                         ..post,
@@ -1212,287 +1455,254 @@ pub fn comment_on_comment(
                         ),
                       )
                   }
-                }
-              }
-            })
-          models.Subreddit(..subreddit, posts: updated_posts)
-        }
+                })
+              models.Subreddit(..subreddit, posts: updated_posts)
+            }
 
-        None -> {
-          printi(
-            "⚠ Subreddit r/" <> subreddit_id <> " not found for commenting",
-          )
-          sub_op
-          |> option.unwrap(
-            models.Subreddit(
-              name: subreddit_id,
-              description: "",
-              subscribers: set.new(),
-              posts: [],
-            ),
-          )
-        }
+            None -> {
+              printi(
+                "⚠ Subreddit r/" <> subreddit_id <> " not found for commenting",
+              )
+              sub_op
+              |> option.unwrap(
+                models.Subreddit(
+                  name: subreddit_id,
+                  description: "",
+                  subscribers: set.new(),
+                  posts: [],
+                ),
+              )
+            }
+          }
+        })
+
+      let success = updated_subreddits != state.subreddits
+      case success {
+        True -> process.send(reply_to, Ok("Commented on post successfully"))
+        False -> process.send(reply_to, Error("Failed to comment on post"))
       }
-    })
 
-  let success = updated_subreddits != state.subreddits
-  process.send(reply_to, success)
-
-  EngineState(
-    ..state,
-    subreddits: updated_subreddits,
-    metrics: PerformanceMetrics(
-      ..state.metrics,
-      total_comments: state.metrics.total_comments
-        + bool.lazy_guard(when: success, return: fn() { 1 }, otherwise: fn() {
-          0
-        }),
-    ),
-  )
-}
-
-pub fn comment_on_post(
-  state: EngineState,
-  username: Username,
-  subreddit_id: SubredditId,
-  post_id: PostId,
-  content: String,
-  reply_to: process.Subject(Bool),
-) -> EngineState {
-  printi(username <> " is commenting on a post in r/" <> subreddit_id)
-
-  // Create top-level comment (no parent)
-  let new_comment =
-    models.Comment(
-      id: models.uuid_gen(),
-      author: username,
-      content: content,
-      timestamp: timestamp.system_time(),
-      upvote: 0,
-      downvote: 0,
-      parent_id: None,
-    )
-
-  // Add comment to the post
-  let updated_subreddits =
-    dict.upsert(state.subreddits, subreddit_id, fn(sub_op) {
-      case sub_op {
-        Some(subreddit) -> {
-          let updated_posts =
-            list.map(subreddit.posts, fn(post) {
-              case post.id == post_id {
-                False -> post
-                True ->
-                  models.Post(
-                    ..post,
-                    comments: dict.insert(
-                      post.comments,
-                      new_comment.id,
-                      new_comment,
-                    ),
-                  )
-              }
-            })
-          models.Subreddit(..subreddit, posts: updated_posts)
-        }
-
-        None -> {
-          printi(
-            "⚠ Subreddit r/" <> subreddit_id <> " not found for commenting",
-          )
-          sub_op
-          |> option.unwrap(
-            models.Subreddit(
-              name: subreddit_id,
-              description: "",
-              subscribers: set.new(),
-              posts: [],
+      EngineState(
+        ..state,
+        subreddits: updated_subreddits,
+        metrics: models.PerformanceMetrics(
+          ..state.metrics,
+          total_comments: state.metrics.total_comments
+            + bool.lazy_guard(
+              when: success,
+              return: fn() { 1 },
+              otherwise: fn() { 0 },
             ),
-          )
-        }
-      }
-    })
-
-  let success = updated_subreddits != state.subreddits
-  process.send(reply_to, success)
-
-  EngineState(
-    ..state,
-    subreddits: updated_subreddits,
-    metrics: PerformanceMetrics(
-      ..state.metrics,
-      total_comments: state.metrics.total_comments
-        + bool.lazy_guard(when: success, return: fn() { 1 }, otherwise: fn() {
-          0
-        }),
-    ),
-  )
+        ),
+      )
+    }
+  }
 }
 
 pub fn leave_subreddit(
   state: EngineState,
   username: Username,
   subreddit_name: SubredditId,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
   printi(username <> " is leaving subreddit " <> subreddit_name)
-  let updated_users =
-    dict.upsert(state.users, username, fn(user_op) {
-      case user_op {
-        Some(user) ->
-          models.User(
-            ..user,
-            subscribed_subreddits: set.delete(
-              user.subscribed_subreddits,
-              subreddit_name,
-            ),
-          )
 
-        None -> {
-          printi("⚠ User " <> username <> " not found for leaving subreddit")
-          user_op
-          |> option.unwrap(
-            models.User(
-              username: username,
-              upvotes: 0,
-              downvotes: 0,
-              subscribed_subreddits: set.new(),
-              inbox: [],
-            ),
-          )
-        }
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
+    }
+    True -> {
+      let updated_users =
+        dict.upsert(state.users, username, fn(user_op) {
+          case user_op {
+            Some(user) ->
+              models.User(
+                ..user,
+                subscribed_subreddits: set.delete(
+                  user.subscribed_subreddits,
+                  subreddit_name,
+                ),
+              )
+
+            None -> {
+              printi(
+                "⚠ User " <> username <> " not found for leaving subreddit",
+              )
+              user_op
+              |> option.unwrap(
+                models.User(
+                  username: username,
+                  upvotes: 0,
+                  downvotes: 0,
+                  subscribed_subreddits: set.new(),
+                  inbox: [],
+                ),
+              )
+            }
+          }
+        })
+
+      let updated_subreddits =
+        dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
+          case sub_op {
+            Some(subreddit) ->
+              models.Subreddit(
+                ..subreddit,
+                subscribers: set.delete(subreddit.subscribers, username),
+              )
+
+            None -> {
+              printi(
+                "⚠ Subreddit r/" <> subreddit_name <> " not found for leaving",
+              )
+              sub_op
+              |> option.unwrap(
+                models.Subreddit(
+                  name: subreddit_name,
+                  description: "",
+                  subscribers: set.new(),
+                  posts: [],
+                ),
+              )
+            }
+          }
+        })
+
+      let success =
+        updated_users != state.users || updated_subreddits != state.subreddits
+      case success {
+        True -> process.send(reply_to, Ok("Left subreddit successfully"))
+        False -> process.send(reply_to, Error("Failed to leave subreddit"))
       }
-    })
 
-  let updated_subreddits =
-    dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
-      case sub_op {
-        Some(subreddit) ->
-          models.Subreddit(
-            ..subreddit,
-            subscribers: set.delete(subreddit.subscribers, username),
-          )
-
-        None -> {
-          printi("⚠ Subreddit r/" <> subreddit_name <> " not found for leaving")
-          sub_op
-          |> option.unwrap(
-            models.Subreddit(
-              name: subreddit_name,
-              description: "",
-              subscribers: set.new(),
-              posts: [],
-            ),
-          )
-        }
-      }
-    })
-
-  let success =
-    updated_users != state.users || updated_subreddits != state.subreddits
-  process.send(reply_to, success)
-
-  EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+      EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+    }
+  }
 }
 
 pub fn join_subreddit(
   state: EngineState,
   username: Username,
   subreddit_name: SubredditId,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
   printi(username <> " is joining r/" <> subreddit_name)
 
-  // Add subreddit to user's subscriptions
-  let updated_users =
-    dict.upsert(state.users, username, fn(user_op) {
-      case user_op {
-        Some(user) ->
-          models.User(
-            ..user,
-            subscribed_subreddits: set.insert(
-              user.subscribed_subreddits,
-              subreddit_name,
-            ),
-          )
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
+    }
+    True -> {
+      // Add subreddit to user's subscriptions
+      let updated_users =
+        dict.upsert(state.users, username, fn(user_op) {
+          case user_op {
+            Some(user) ->
+              models.User(
+                ..user,
+                subscribed_subreddits: set.insert(
+                  user.subscribed_subreddits,
+                  subreddit_name,
+                ),
+              )
 
-        None -> {
-          printi("⚠ User " <> username <> " not found for joining subreddit")
-          user_op
-          |> option.unwrap(
-            models.User(
-              username: username,
-              upvotes: 0,
-              downvotes: 0,
-              subscribed_subreddits: set.from_list([subreddit_name]),
-              inbox: [],
-            ),
-          )
-        }
+            None -> {
+              printi(
+                "⚠ User " <> username <> " not found for joining subreddit",
+              )
+              user_op
+              |> option.unwrap(
+                models.User(
+                  username: username,
+                  upvotes: 0,
+                  downvotes: 0,
+                  subscribed_subreddits: set.from_list([subreddit_name]),
+                  inbox: [],
+                ),
+              )
+            }
+          }
+        })
+
+      // Add user to subreddit's subscriber list
+      let updated_subreddits =
+        dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
+          case sub_op {
+            Some(subreddit) ->
+              models.Subreddit(
+                ..subreddit,
+                subscribers: set.insert(subreddit.subscribers, username),
+              )
+
+            None -> {
+              printi(
+                "⚠ Subreddit r/" <> subreddit_name <> " not found for joining",
+              )
+              sub_op
+              |> option.unwrap(
+                models.Subreddit(
+                  name: subreddit_name,
+                  description: "",
+                  subscribers: set.from_list([username]),
+                  posts: [],
+                ),
+              )
+            }
+          }
+        })
+      let success =
+        updated_users != state.users || updated_subreddits != state.subreddits
+      case success {
+        True -> process.send(reply_to, Ok("Joined subreddit successfully"))
+        False -> process.send(reply_to, Error("Failed to join subreddit"))
       }
-    })
-
-  // Add user to subreddit's subscriber list
-  let updated_subreddits =
-    dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
-      case sub_op {
-        Some(subreddit) ->
-          models.Subreddit(
-            ..subreddit,
-            subscribers: set.insert(subreddit.subscribers, username),
-          )
-
-        None -> {
-          printi("⚠ Subreddit r/" <> subreddit_name <> " not found for joining")
-          sub_op
-          |> option.unwrap(
-            models.Subreddit(
-              name: subreddit_name,
-              description: "",
-              subscribers: set.from_list([username]),
-              posts: [],
-            ),
-          )
-        }
-      }
-    })
-  let success =
-    updated_users != state.users || updated_subreddits != state.subreddits
-  process.send(reply_to, success)
-  EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+      EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+    }
+  }
 }
 
 pub fn create_subreddit(
   state: EngineState,
+  username: Username,
   name: SubredditId,
   description: String,
-  reply_to: process.Subject(Bool),
+  reply_to: process.Subject(Result(String, String)),
 ) -> EngineState {
-  // Create new subreddit with empty subscriber list and posts
-  let new_subreddit =
-    models.Subreddit(
-      name: name,
-      description: description,
-      subscribers: set.new(),
-      posts: [],
-    )
-
-  // Check if subreddit already exists to avoid duplicates
-  let updated_subreddits = case dict.get(state.subreddits, name) {
-    Ok(_) -> {
-      printi("⚠ Subreddit r/" <> name <> " already exists")
-      process.send(reply_to, False)
-      state.subreddits
+  case dict.has_key(state.users, username) {
+    False -> {
+      process.send(reply_to, Error("Invalid user"))
+      state
     }
+    True -> {
+      // Create new subreddit with empty subscriber list and posts
+      let new_subreddit =
+        models.Subreddit(
+          name: name,
+          description: description,
+          subscribers: set.new(),
+          posts: [],
+        )
 
-    Error(_) -> {
-      printi("✓ Created subreddit r/" <> name)
-      process.send(reply_to, True)
-      dict.insert(state.subreddits, name, new_subreddit)
+      // Check if subreddit already exists to avoid duplicates
+      let updated_subreddits = case dict.get(state.subreddits, name) {
+        Ok(_) -> {
+          printi("⚠ Subreddit r/" <> name <> " already exists")
+          process.send(reply_to, Error("Subreddit exists"))
+          state.subreddits
+        }
+
+        Error(_) -> {
+          printi("✓ Created subreddit r/" <> name)
+          process.send(reply_to, Ok("Subreddit created successfully"))
+          dict.insert(state.subreddits, name, new_subreddit)
+        }
+      }
+
+      EngineState(..state, subreddits: updated_subreddits)
     }
   }
-
-  EngineState(..state, subreddits: updated_subreddits)
 }
 
 pub fn register_user(
@@ -1527,7 +1737,7 @@ pub fn register_user(
   EngineState(
     ..state,
     users: updated_users,
-    metrics: PerformanceMetrics(
+    metrics: models.PerformanceMetrics(
       ..state.metrics,
       total_users: state.metrics.total_users
         + bool.lazy_guard(
@@ -1545,142 +1755,4 @@ fn printi(str: String) -> Nil {
     False -> Nil
   }
   Nil
-}
-
-// ═══════════════════════════════════════════════════════
-// Distributed Erlang FFI Functions
-// ═══════════════════════════════════════════════════════
-
-// Convert atom to Name for static naming (no random suffix)
-@external(erlang, "distr", "atom_to_name")
-fn atom_to_name(atom: atom.Atom) -> process.Name(message)
-
-// Start distributed Erlang with longnames
-@external(erlang, "distr", "start_short")
-pub fn net_kernel_start(name: Charlist) -> Bool
-
-// Set Erlang cookie for node authentication
-@external(erlang, "distr", "set_cookie_erlang")
-fn set_cookie_erlang(name: Charlist, cookie: Charlist) -> Bool
-
-// Get current Erlang cookie
-@external(erlang, "distr", "get_cookie")
-pub fn get_cookie_erlang() -> Charlist
-
-// Ping a remote node to check connectivity
-@external(erlang, "distr", "ping")
-pub fn ping_erlang(name: Charlist) -> PingResponse
-
-pub type PingResponse {
-  Pong
-  Pang
-}
-
-// Find a process registered on a remote node
-@external(erlang, "distr", "whereis_remote")
-fn whereis_remote_erlang(
-  registered_name: Charlist,
-  node_name: Charlist,
-) -> Result(process.Pid, atom.Atom)
-
-// Register a process in the global registry
-@external(erlang, "distr", "register_global")
-fn register_global_erlang(
-  name: Charlist,
-  pid: process.Pid,
-) -> Result(atom.Atom, atom.Atom)
-
-// Find a process in the global registry
-@external(erlang, "distr", "whereis_global")
-fn whereis_global_erlang(name: Charlist) -> Result(process.Pid, atom.Atom)
-
-// Send message to a named subject on a remote node
-@external(erlang, "distr", "send_to_named_subject")
-fn send_to_named_subject_erlang(
-  pid: process.Pid,
-  registered_name: Charlist,
-  message: a,
-) -> atom.Atom
-
-// List all connected nodes
-@external(erlang, "distr", "list_nodes")
-fn list_nodes_erlang() -> List(atom.Atom)
-
-// List all globally registered process names
-@external(erlang, "distr", "list_global_names")
-fn list_global_names_erlang() -> List(atom.Atom)
-
-// ═══════════════════════════════════════════════════════
-// Public Wrapper Functions
-// ═══════════════════════════════════════════════════════
-
-pub fn register_global(name: String, pid: process.Pid) -> Result(Nil, String) {
-  case register_global_erlang(charlist.from_string(name), pid) {
-    Ok(_) -> Ok(Nil)
-    Error(_) -> Error("Failed to register process globally")
-  }
-}
-
-pub fn whereis_global(name: String) -> Result(process.Pid, String) {
-  case whereis_global_erlang(charlist.from_string(name)) {
-    Ok(pid) -> Ok(pid)
-    Error(_) -> Error("Process not found in global registry")
-  }
-}
-
-pub fn list_nodes() -> List(atom.Atom) {
-  list_nodes_erlang()
-}
-
-pub fn list_global_names() -> List(atom.Atom) {
-  list_global_names_erlang()
-}
-
-pub fn whereis_remote(
-  registered_name: String,
-  node_name: String,
-) -> Result(process.Pid, String) {
-  case
-    whereis_remote_erlang(
-      charlist.from_string(registered_name),
-      charlist.from_string(node_name),
-    )
-  {
-    Ok(pid) -> Ok(pid)
-    Error(_) -> Error("Process not found on remote node")
-  }
-}
-
-pub fn send_to_named_subject(
-  pid: process.Pid,
-  registered_name: String,
-  message: a,
-) -> Nil {
-  send_to_named_subject_erlang(
-    pid,
-    charlist.from_string(registered_name),
-    message,
-  )
-  Nil
-}
-
-pub fn set_cookie(nodename: String, cookie: String) {
-  set_cookie_erlang(
-    charlist.from_string(nodename),
-    charlist.from_string(cookie),
-  )
-}
-
-pub type PerformanceMetrics {
-  PerformanceMetrics(
-    total_users: Int,
-    total_posts: Int,
-    total_comments: Int,
-    total_votes: Int,
-    total_messages: Int,
-    simulation_start_time: timestamp.Timestamp,
-    simulation_checkpoint_time: timestamp.Timestamp,
-    posts_per_second: Float,
-    messages_per_second: Float,
-  )
 }

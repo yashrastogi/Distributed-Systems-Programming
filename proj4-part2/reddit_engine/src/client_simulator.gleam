@@ -10,11 +10,13 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
+import gleam/time/timestamp
 import gleam/uri
+import models.{type PerformanceMetrics}
 
-const total_users = 2
+const total_users = 100_000
 
-const api_host = "localhost"
+const api_host = "192.168.139.3"
 
 const api_port = 8080
 
@@ -95,10 +97,13 @@ fn run_simulation(post_tracker: process.Subject(PostTrackingMessage)) {
   io.println("Phase 1: Setting up Subreddits")
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
+  // Register admin user for creating subreddits
+  let _ = register_user("admin")
+
   // Create subreddits
   list.each(subreddits_by_rank, fn(subreddit) {
     let #(name, desc, _) = subreddit
-    let _ = create_subreddit(name, desc)
+    let _ = create_subreddit("admin", name, desc)
     io.println("✓ Created subreddit: " <> name)
   })
   io.println("")
@@ -169,19 +174,6 @@ fn float_to_string(f: Float, precision p: Int) -> String {
   }
 }
 
-// Define the record structure for performance metrics
-type PerformanceMetrics {
-  PerformanceMetrics(
-    total_users: Int,
-    total_posts: Int,
-    total_comments: Int,
-    total_votes: Int,
-    total_messages: Int,
-    posts_per_second: Float,
-    messages_per_second: Float,
-  )
-}
-
 // Define a decoder for the PerformanceMetrics
 fn performance_metrics_decoder() -> decode.Decoder(PerformanceMetrics) {
   use total_users <- decode.field("total_users", decode.int)
@@ -191,14 +183,29 @@ fn performance_metrics_decoder() -> decode.Decoder(PerformanceMetrics) {
   use total_messages <- decode.field("total_messages", decode.int)
   use posts_per_second <- decode.field("posts_per_second", decode.float)
   use messages_per_second <- decode.field("messages_per_second", decode.float)
-  decode.success(PerformanceMetrics(
-    total_users,
-    total_posts,
-    total_comments,
-    total_votes,
-    total_messages,
-    posts_per_second,
-    messages_per_second,
+  use simulation_start_time <- decode.field(
+    "simulation_start_time",
+    decode.float,
+  )
+  use simulation_checkpoint_time <- decode.field(
+    "simulation_checkpoint_time",
+    decode.float,
+  )
+
+  decode.success(models.PerformanceMetrics(
+    total_users: total_users,
+    total_posts: total_posts,
+    total_comments: total_comments,
+    total_votes: total_votes,
+    total_messages: total_messages,
+    simulation_start_time: timestamp.from_unix_seconds(
+      simulation_start_time |> float.round,
+    ),
+    simulation_checkpoint_time: timestamp.from_unix_seconds(
+      simulation_checkpoint_time |> float.round,
+    ),
+    posts_per_second: posts_per_second,
+    messages_per_second: messages_per_second,
   ))
 }
 
@@ -386,8 +393,15 @@ fn perform_online_activities(
             generate_content(cycle * 100 + activity_num),
           )
         {
-          Ok(post_id) -> {
-            process.send(post_tracker, AddPost(subreddit, post_id))
+          Ok(response_body) -> {
+            let decoder = {
+              use id <- decode.field("post_id", decode.string)
+              decode.success(id)
+            }
+            case json.parse(from: response_body, using: decoder) {
+              Ok(id) -> process.send(post_tracker, AddPost(subreddit, id))
+              Error(_) -> Nil
+            }
           }
 
           Error(_) -> Nil
@@ -555,21 +569,33 @@ fn select_by_cumulative_probability(
 // HTTP API Helpers
 
 fn register_user(username: String) -> Result(String, String) {
-  let body = "username=" <> username
-  post_request("/register", body)
+  let body = "username=" <> uri.percent_encode(username)
+  post_request("/users", body)
 }
 
 fn create_subreddit(
+  username: String,
   title: String,
   description: String,
 ) -> Result(String, String) {
-  let body = "title=" <> title <> "&description=" <> description
-  post_request("/create/subreddit", body)
+  let body =
+    "username="
+    <> uri.percent_encode(username)
+    <> "&title="
+    <> uri.percent_encode(title)
+    <> "&description="
+    <> uri.percent_encode(description)
+  post_request("/subreddits", body)
 }
 
 fn join_subreddit(username: String, subreddit: String) -> Result(String, String) {
-  let body = "username=" <> username <> "&subreddit=" <> subreddit
-  post_request("/join/subreddit", body)
+  put_request(
+    "/users/"
+      <> uri.percent_encode(username)
+      <> "/subscriptions/"
+      <> uri.percent_encode(subreddit),
+    "",
+  )
 }
 
 fn create_post(
@@ -580,15 +606,16 @@ fn create_post(
 ) -> Result(String, String) {
   let body =
     "username="
-    <> username
-    <> "&subreddit="
-    <> subreddit
+    <> uri.percent_encode(username)
     <> "&title="
-    <> title
+    <> uri.percent_encode(title)
     <> "&content="
-    <> content
+    <> uri.percent_encode(content)
 
-  post_request("/create/post", body)
+  post_request(
+    "/subreddits/" <> uri.percent_encode(subreddit) <> "/posts",
+    body,
+  )
 }
 
 fn comment_on_post(
@@ -599,14 +626,17 @@ fn comment_on_post(
 ) -> Result(String, String) {
   let body =
     "username="
-    <> username
-    <> "&subreddit="
-    <> subreddit
-    <> "&post_id="
-    <> uri.percent_encode(post_id)
+    <> uri.percent_encode(username)
     <> "&content="
-    <> content
-  post_request("/comment/post", body)
+    <> uri.percent_encode(content)
+  post_request(
+    "/subreddits/"
+      <> uri.percent_encode(subreddit)
+      <> "/posts/"
+      <> uri.percent_encode(post_id)
+      <> "/comments",
+    body,
+  )
 }
 
 fn vote_post(
@@ -617,14 +647,12 @@ fn vote_post(
 ) -> Result(String, String) {
   let body =
     "username="
-    <> username
+    <> uri.percent_encode(username)
     <> "&subreddit="
-    <> subreddit
-    <> "&post_id="
-    <> uri.percent_encode(post_id)
+    <> uri.percent_encode(subreddit)
     <> "&vote="
-    <> vote
-  post_request("/vote", body)
+    <> uri.percent_encode(vote)
+  post_request("/posts/" <> uri.percent_encode(post_id) <> "/votes", body)
 }
 
 fn send_direct_message(
@@ -632,16 +660,24 @@ fn send_direct_message(
   to: String,
   content: String,
 ) -> Result(String, String) {
-  let body = "from=" <> from <> "&to=" <> to <> "&content=" <> content
-  post_request("/dm", body)
+  let body =
+    "from="
+    <> uri.percent_encode(from)
+    <> "&to="
+    <> uri.percent_encode(to)
+    <> "&content="
+    <> uri.percent_encode(content)
+  post_request("/dms", body)
 }
 
 fn get_feed(username: String) -> Result(String, String) {
-  get_request("/feed/" <> username)
+  get_request("/users/" <> uri.percent_encode(username) <> "/feed")
 }
 
 fn get_subreddit_member_count(subreddit: String) -> Result(Int, String) {
-  case get_request("/subreddit/members/" <> subreddit) {
+  case
+    get_request("/subreddits/" <> uri.percent_encode(subreddit) <> "/members")
+  {
     Ok(body) -> {
       case int.parse(body) {
         Ok(i) -> Ok(i)
@@ -690,6 +726,27 @@ fn get_request(path: String) -> Result(String, String) {
     Ok(resp) ->
       case resp.status {
         200 -> Ok(resp.body)
+        _ -> Error("Request failed with status " <> int.to_string(resp.status))
+      }
+    Error(_) -> Error("HTTP request failed")
+  }
+}
+
+fn put_request(path: String, body: String) -> Result(String, String) {
+  let req =
+    request.new()
+    |> request.set_method(http.Put)
+    |> request.set_scheme(http.Http)
+    |> request.set_host(api_host)
+    |> request.set_port(api_port)
+    |> request.set_path(path)
+    |> request.set_body(body)
+    |> request.set_header("content-type", "application/x-www-form-urlencoded")
+
+  case httpc.send(req) {
+    Ok(resp) ->
+      case resp.status {
+        200 | 201 -> Ok(resp.body)
         _ -> Error("Request failed with status " <> int.to_string(resp.status))
       }
     Error(_) -> Error("HTTP request failed")

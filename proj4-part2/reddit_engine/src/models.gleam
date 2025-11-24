@@ -86,3 +86,17 @@ pub type VoteType {
 
 pub type Username =
   String
+
+pub type PerformanceMetrics {
+  PerformanceMetrics(
+    total_users: Int,
+    total_posts: Int,
+    total_comments: Int,
+    total_votes: Int,
+    total_messages: Int,
+    simulation_start_time: timestamp.Timestamp,
+    simulation_checkpoint_time: timestamp.Timestamp,
+    posts_per_second: Float,
+    messages_per_second: Float,
+  )
+}
