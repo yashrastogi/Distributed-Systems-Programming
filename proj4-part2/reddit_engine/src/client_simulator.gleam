@@ -14,7 +14,7 @@ import gleam/time/timestamp
 import gleam/uri
 import models.{type PerformanceMetrics}
 
-const total_users = 100_000
+const total_users = 10_000
 
 const api_host = "192.168.139.3"
 
@@ -51,6 +51,10 @@ pub fn main() {
 pub type PostTrackingMessage {
   AddPost(subreddit: String, post_id: String)
   GetRandomPost(reply_to: process.Subject(Result(#(String, String), Nil)))
+  AddComment(subreddit: String, post_id: String, comment_id: String)
+  GetRandomComment(
+    reply_to: process.Subject(Result(#(String, String, String), Nil)),
+  )
 }
 
 // Actor to track posts across all users for voting/commenting
@@ -61,7 +65,7 @@ fn start_post_tracker() -> process.Subject(PostTrackingMessage) {
     let subject = process.new_subject()
     // Send the subject back to parent
     process.send(parent_subject, subject)
-    post_tracker_loop(subject, [])
+    post_tracker_loop(subject, [], [])
   })
 
   // Wait for the subject from the spawned process
@@ -72,10 +76,11 @@ fn start_post_tracker() -> process.Subject(PostTrackingMessage) {
 fn post_tracker_loop(
   subject: process.Subject(PostTrackingMessage),
   posts: List(#(String, String)),
+  comments: List(#(String, String, String)),
 ) {
   case process.receive(subject, 10) {
     Ok(AddPost(subreddit, post_id)) -> {
-      post_tracker_loop(subject, [#(subreddit, post_id), ..posts])
+      post_tracker_loop(subject, [#(subreddit, post_id), ..posts], comments)
     }
     Ok(GetRandomPost(reply_to)) -> {
       let result = case list.shuffle(posts) |> list.first {
@@ -83,11 +88,25 @@ fn post_tracker_loop(
         Error(_) -> Error(Nil)
       }
       process.send(reply_to, result)
-      post_tracker_loop(subject, posts)
+      post_tracker_loop(subject, posts, comments)
+    }
+    Ok(AddComment(subreddit, post_id, comment_id)) -> {
+      post_tracker_loop(subject, posts, [
+        #(subreddit, post_id, comment_id),
+        ..comments
+      ])
+    }
+    Ok(GetRandomComment(reply_to)) -> {
+      let result = case list.shuffle(comments) |> list.first {
+        Ok(comment) -> Ok(comment)
+        Error(_) -> Error(Nil)
+      }
+      process.send(reply_to, result)
+      post_tracker_loop(subject, posts, comments)
     }
     Error(_) -> {
       // Timeout, continue
-      post_tracker_loop(subject, posts)
+      post_tracker_loop(subject, posts, comments)
     }
   }
 }
@@ -410,20 +429,78 @@ fn perform_online_activities(
         process.sleep(int.random(300) + 100)
       }
 
-      // 20% Comment on a post
-      3 | 4 -> {
+      // 10% Comment on a post
+      3 -> {
         let reply_subject = process.new_subject()
         process.send(post_tracker, GetRandomPost(reply_subject))
 
         case process.receive(reply_subject, 100) {
           Ok(Ok(#(subreddit, post_id))) -> {
-            let _ =
+            case
               comment_on_post(
                 username,
                 subreddit,
                 post_id,
                 "Great post! Here are my thoughts...",
               )
+            {
+              Ok(response_body) -> {
+                let decoder = {
+                  use id <- decode.field("comment_id", decode.string)
+                  decode.success(id)
+                }
+                case json.parse(from: response_body, using: decoder) {
+                  Ok(id) ->
+                    process.send(
+                      post_tracker,
+                      AddComment(subreddit, post_id, id),
+                    )
+                  Error(_) -> Nil
+                }
+              }
+              Error(_) -> Nil
+            }
+            process.sleep(int.random(200) + 50)
+          }
+          _ -> Nil
+        }
+      }
+
+      // 10% Reply to a comment
+      4 -> {
+        let reply_subject = process.new_subject()
+        process.send(post_tracker, GetRandomComment(reply_subject))
+
+        case process.receive(reply_subject, 100) {
+          Ok(Ok(#(subreddit, post_id, comment_id))) -> {
+            case
+              comment_on_comment(
+                username,
+                subreddit,
+                post_id,
+                comment_id,
+                "Interesting point! I agree.",
+              )
+            {
+              Ok(response_body) -> {
+                let decoder = {
+                  use id <- decode.field("comment_id", decode.string)
+                  decode.success(id)
+                }
+                case json.parse(from: response_body, using: decoder) {
+                  Ok(id) ->
+                    process.send(
+                      post_tracker,
+                      AddComment(subreddit, post_id, id),
+                    )
+                  Error(_) -> Nil
+                }
+              }
+
+              Error(_) -> {
+                Nil
+              }
+            }
             process.sleep(int.random(200) + 50)
           }
           _ -> Nil
@@ -639,6 +716,29 @@ fn comment_on_post(
   )
 }
 
+fn comment_on_comment(
+  username: String,
+  subreddit: String,
+  post_id: String,
+  parent_comment_id: String,
+  content: String,
+) -> Result(String, String) {
+  let body =
+    "username="
+    <> uri.percent_encode(username)
+    <> "&subreddit="
+    <> uri.percent_encode(subreddit)
+    <> "&post_id="
+    <> uri.percent_encode(post_id)
+    <> "&content="
+    <> uri.percent_encode(content)
+
+  post_request(
+    "/comments/" <> uri.percent_encode(parent_comment_id) <> "/replies",
+    body,
+  )
+}
+
 fn vote_post(
   username: String,
   subreddit: String,
@@ -707,7 +807,13 @@ fn post_request(path: String, body: String) -> Result(String, String) {
     Ok(resp) ->
       case resp.status {
         200 | 201 -> Ok(resp.body)
-        _ -> Error("Request failed with status " <> int.to_string(resp.status))
+        _ ->
+          Error(
+            "Request failed with status "
+            <> int.to_string(resp.status)
+            <> " "
+            <> resp.body,
+          )
       }
     Error(_) -> Error("HTTP request failed")
   }

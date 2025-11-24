@@ -178,38 +178,46 @@ pub fn handle_request(
 
       case result {
         Ok(posts) -> {
-          let posts_to_json = fn(posts: List(Post)) -> String {
+          let posts_to_json = fn(posts: List(#(SubredditId, Post))) -> String {
             json.object([
               #(
                 "posts",
                 json.array(
                   list.map(posts, fn(post) {
                     [
-                      #("title", json.string(post.title)),
-                      #("content", json.string(post.content)),
-                      #("author", json.string(post.author)),
+                      #("subreddit_id", json.string(post.0)),
+                      #("title", json.string({ post.1 }.title)),
+                      #("content", json.string({ post.1 }.content)),
+                      #("author", json.string({ post.1 }.author)),
+                      #("upvote", json.int({ post.1 }.upvote)),
+                      #("downvote", json.int({ post.1 }.downvote)),
                       #(
                         "comments",
-                        json.array(dict.values(post.comments), fn(comment) {
-                          json.object([
-                            #("content", json.string(comment.content)),
-                            #("author", json.string(comment.author)),
-                            #("upvote", json.int(comment.upvote)),
-                            #("downvote", json.int(comment.downvote)),
-                            #(
-                              "timestamp",
-                              json.float(
-                                comment.timestamp |> timestamp.to_unix_seconds,
+                        json.array(
+                          dict.values({ post.1 }.comments),
+                          fn(comment) {
+                            json.object([
+                              #("content", json.string(comment.content)),
+                              #("author", json.string(comment.author)),
+                              #("upvote", json.int(comment.upvote)),
+                              #("downvote", json.int(comment.downvote)),
+                              #(
+                                "timestamp",
+                                json.float(
+                                  comment.timestamp |> timestamp.to_unix_seconds,
+                                ),
                               ),
-                            ),
-                          ])
-                        }),
+                            ])
+                          },
+                        ),
                       ),
-                      #("upvote", json.int(post.upvote)),
-                      #("downvote", json.int(post.downvote)),
+                      #("upvote", json.int({ post.1 }.upvote)),
+                      #("downvote", json.int({ post.1 }.downvote)),
                       #(
                         "timestamp",
-                        json.float(post.timestamp |> timestamp.to_unix_seconds),
+                        json.float(
+                          { post.1 }.timestamp |> timestamp.to_unix_seconds,
+                        ),
                       ),
                     ]
                   }),
@@ -315,15 +323,16 @@ pub fn handle_request(
                       )
                     })
                   case result {
-                    Ok(msg) ->
+                    Ok(id) -> {
+                      let models.Uuid(value: id_bits) = id
+                      let id_str = bit_array.base64_encode(id_bits, True)
                       wisp.json_response(
                         json.to_string(
-                          json.object([
-                            #("message", json.string(msg)),
-                          ]),
+                          json.object([#("comment_id", json.string(id_str))]),
                         ),
                         201,
                       )
+                    }
                     Error(err) ->
                       wisp.json_response(
                         json.to_string(
@@ -352,6 +361,7 @@ pub fn handle_request(
     ["comments", parent_comment_id_str, "replies"] -> {
       use <- wisp.require_method(req, Post)
       use formdata <- wisp.require_form(req)
+
       case
         get_form_params(formdata, [
           "username",
@@ -361,53 +371,60 @@ pub fn handle_request(
         ])
       {
         Ok([username, subreddit, post_id_str, content]) -> {
-          case
-            bit_array.base64_decode(post_id_str),
-            bit_array.base64_decode(parent_comment_id_str)
-          {
-            Ok(a), Ok(b) -> {
-              let post_id_b = models.Uuid(value: a)
-              let parent_comment_id_b = models.Uuid(value: b)
+          case uri.percent_decode(parent_comment_id_str) {
+            Ok(parent_comment_id_str) -> {
+              case
+                bit_array.base64_decode(post_id_str),
+                bit_array.base64_decode(parent_comment_id_str)
+              {
+                Ok(a), Ok(b) -> {
+                  let post_id_b = models.Uuid(value: a)
+                  let parent_comment_id_b = models.Uuid(value: b)
 
-              let result =
-                process.call(engine_inbox, 1000, fn(r) {
-                  CommentOnComment(
-                    username,
-                    subreddit,
-                    post_id_b,
-                    parent_comment_id_b,
-                    content,
-                    r,
-                  )
-                })
-              case result {
-                Ok(msg) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("message", json.string(msg)),
-                      ]),
-                    ),
-                    201,
-                  )
-                Error(err) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("error", json.string(err)),
-                      ]),
-                    ),
-                    400,
-                  )
+                  let result =
+                    process.call(engine_inbox, 1000, fn(r) {
+                      CommentOnComment(
+                        username,
+                        subreddit,
+                        post_id_b,
+                        parent_comment_id_b,
+                        content,
+                        r,
+                      )
+                    })
+                  case result {
+                    Ok(id) -> {
+                      let models.Uuid(value: id_bits) = id
+                      let id_str = bit_array.base64_encode(id_bits, True)
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([#("comment_id", json.string(id_str))]),
+                        ),
+                        201,
+                      )
+                    }
+                    Error(err) ->
+                      wisp.json_response(
+                        json.to_string(
+                          json.object([
+                            #("error", json.string(err)),
+                          ]),
+                        ),
+                        400,
+                      )
+                  }
+                }
+
+                Ok(_), Error(_) -> wisp.bad_request("Invalid parent_comment_id")
+
+                Error(_), Ok(_) -> wisp.bad_request("Invalid post_id")
+
+                Error(_), Error(_) ->
+                  wisp.bad_request("Invalid parent_comment_id and post_id")
               }
             }
 
-            Ok(_), Error(_) -> wisp.bad_request("Invalid parent_comment_id")
-
-            Error(_), Ok(_) -> wisp.bad_request("Invalid post_id")
-
-            Error(_), Error(_) ->
-              wisp.bad_request("Invalid parent_comment_id and post_id")
+            Error(_) -> wisp.bad_request("Invalid parent_comment_id")
           }
         }
         _ -> wisp.bad_request("Form parameters are invalid")
@@ -458,10 +475,7 @@ pub fn handle_request(
                       )
                   }
                 }
-                Error(_) -> {
-                  echo post_id_str
-                  wisp.bad_request("Invalid post id")
-                }
+                Error(_) -> wisp.bad_request("Invalid post id")
               }
             }
 
@@ -734,7 +748,7 @@ pub type EngineMessage {
     subreddit_id: SubredditId,
     post_id: PostId,
     content: String,
-    reply_to: process.Subject(Result(String, String)),
+    reply_to: process.Subject(Result(CommentId, String)),
   )
   CommentOnComment(
     username: Username,
@@ -742,7 +756,7 @@ pub type EngineMessage {
     post_id: PostId,
     parent_comment_id: CommentId,
     content: String,
-    reply_to: process.Subject(Result(String, String)),
+    reply_to: process.Subject(Result(CommentId, String)),
   )
   VotePost(
     subreddit_id: SubredditId,
@@ -753,7 +767,7 @@ pub type EngineMessage {
   )
   GetFeed(
     username: Username,
-    reply_to: process.Subject(Result(List(Post), String)),
+    reply_to: process.Subject(Result(List(#(SubredditId, Post)), String)),
   )
   GetDirectMessages(
     username: Username,
@@ -1271,18 +1285,21 @@ pub fn get_direct_messages(
 pub fn get_feed(
   state: EngineState,
   username: Username,
-  reply_to: process.Subject(Result(List(Post), String)),
+  reply_to: process.Subject(Result(List(#(SubredditId, Post)), String)),
 ) -> EngineState {
   // Get user's subscribed subreddits
   let result = case dict.get(state.users, username) {
     Ok(user) -> {
-      // Aggregate posts from subscribed subreddits (top 5 from each)
+      // Aggregate posts from subscribed subreddits (first 5 from each)
       let feed_posts =
         user.subscribed_subreddits
         |> set.to_list
         |> list.map(fn(subreddit_id) {
           case dict.get(state.subreddits, subreddit_id) {
-            Ok(subreddit) -> subreddit.posts |> list.take(5)
+            Ok(subreddit) ->
+              subreddit.posts
+              |> list.take(5)
+              |> list.map(fn(post) { #(subreddit.name, post) })
             Error(_) -> []
           }
         })
@@ -1315,7 +1332,7 @@ pub fn comment_on_comment(
   post_id: PostId,
   parent_comment_id: CommentId,
   content: String,
-  reply_to: process.Subject(Result(String, String)),
+  reply_to: process.Subject(Result(CommentId, String)),
 ) -> EngineState {
   printi(username <> " is replying to a comment in r/" <> subreddit_id)
 
@@ -1387,7 +1404,7 @@ pub fn comment_on_comment(
 
       let success = updated_subreddits != state.subreddits
       case success {
-        True -> process.send(reply_to, Ok("Commented on comment successfully"))
+        True -> process.send(reply_to, Ok(new_comment.id))
         False -> process.send(reply_to, Error("Failed to comment on comment"))
       }
 
@@ -1414,7 +1431,7 @@ pub fn comment_on_post(
   subreddit_id: SubredditId,
   post_id: PostId,
   content: String,
-  reply_to: process.Subject(Result(String, String)),
+  reply_to: process.Subject(Result(CommentId, String)),
 ) -> EngineState {
   printi(username <> " is commenting on a post in r/" <> subreddit_id)
 
@@ -1478,7 +1495,7 @@ pub fn comment_on_post(
 
       let success = updated_subreddits != state.subreddits
       case success {
-        True -> process.send(reply_to, Ok("Commented on post successfully"))
+        True -> process.send(reply_to, Ok(new_comment.id))
         False -> process.send(reply_to, Error("Failed to comment on post"))
       }
 
