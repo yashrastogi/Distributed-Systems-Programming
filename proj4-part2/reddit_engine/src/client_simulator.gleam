@@ -643,11 +643,13 @@ fn select_by_cumulative_probability(
   }
 }
 
+import gleam/option.{type Option, None, Some}
+
 // HTTP API Helpers
 
 fn register_user(username: String) -> Result(String, String) {
   let body = "username=" <> uri.percent_encode(username)
-  post_request("/users", body)
+  post_request("/users", body, None)
 }
 
 fn create_subreddit(
@@ -656,13 +658,11 @@ fn create_subreddit(
   description: String,
 ) -> Result(String, String) {
   let body =
-    "username="
-    <> uri.percent_encode(username)
-    <> "&title="
+    "title="
     <> uri.percent_encode(title)
     <> "&description="
     <> uri.percent_encode(description)
-  post_request("/subreddits", body)
+  post_request("/subreddits", body, Some(username))
 }
 
 fn join_subreddit(username: String, subreddit: String) -> Result(String, String) {
@@ -672,6 +672,7 @@ fn join_subreddit(username: String, subreddit: String) -> Result(String, String)
       <> "/subscriptions/"
       <> uri.percent_encode(subreddit),
     "",
+    Some(username),
   )
 }
 
@@ -682,9 +683,7 @@ fn create_post(
   content: String,
 ) -> Result(String, String) {
   let body =
-    "username="
-    <> uri.percent_encode(username)
-    <> "&title="
+    "title="
     <> uri.percent_encode(title)
     <> "&content="
     <> uri.percent_encode(content)
@@ -692,6 +691,7 @@ fn create_post(
   post_request(
     "/subreddits/" <> uri.percent_encode(subreddit) <> "/posts",
     body,
+    Some(username),
   )
 }
 
@@ -701,11 +701,7 @@ fn comment_on_post(
   post_id: String,
   content: String,
 ) -> Result(String, String) {
-  let body =
-    "username="
-    <> uri.percent_encode(username)
-    <> "&content="
-    <> uri.percent_encode(content)
+  let body = "content=" <> uri.percent_encode(content)
   post_request(
     "/subreddits/"
       <> uri.percent_encode(subreddit)
@@ -713,6 +709,7 @@ fn comment_on_post(
       <> uri.percent_encode(post_id)
       <> "/comments",
     body,
+    Some(username),
   )
 }
 
@@ -724,9 +721,7 @@ fn comment_on_comment(
   content: String,
 ) -> Result(String, String) {
   let body =
-    "username="
-    <> uri.percent_encode(username)
-    <> "&subreddit="
+    "subreddit="
     <> uri.percent_encode(subreddit)
     <> "&post_id="
     <> uri.percent_encode(post_id)
@@ -736,6 +731,7 @@ fn comment_on_comment(
   post_request(
     "/comments/" <> uri.percent_encode(parent_comment_id) <> "/replies",
     body,
+    Some(username),
   )
 }
 
@@ -746,13 +742,15 @@ fn vote_post(
   vote: String,
 ) -> Result(String, String) {
   let body =
-    "username="
-    <> uri.percent_encode(username)
-    <> "&subreddit="
+    "subreddit="
     <> uri.percent_encode(subreddit)
     <> "&vote="
     <> uri.percent_encode(vote)
-  post_request("/posts/" <> uri.percent_encode(post_id) <> "/votes", body)
+  post_request(
+    "/posts/" <> uri.percent_encode(post_id) <> "/votes",
+    body,
+    Some(username),
+  )
 }
 
 fn send_direct_message(
@@ -761,22 +759,26 @@ fn send_direct_message(
   content: String,
 ) -> Result(String, String) {
   let body =
-    "from="
-    <> uri.percent_encode(from)
-    <> "&to="
+    "to="
     <> uri.percent_encode(to)
     <> "&content="
     <> uri.percent_encode(content)
-  post_request("/dms", body)
+  post_request("/dms", body, Some(from))
 }
 
 fn get_feed(username: String) -> Result(String, String) {
-  get_request("/users/" <> uri.percent_encode(username) <> "/feed")
+  get_request(
+    "/users/" <> uri.percent_encode(username) <> "/feed",
+    Some(username),
+  )
 }
 
 fn get_subreddit_member_count(subreddit: String) -> Result(Int, String) {
   case
-    get_request("/subreddits/" <> uri.percent_encode(subreddit) <> "/members")
+    get_request(
+      "/subreddits/" <> uri.percent_encode(subreddit) <> "/members",
+      None,
+    )
   {
     Ok(body) -> {
       case int.parse(body) {
@@ -789,10 +791,14 @@ fn get_subreddit_member_count(subreddit: String) -> Result(Int, String) {
 }
 
 fn get_engine_metrics() -> Result(String, String) {
-  get_request("/metrics")
+  get_request("/metrics", None)
 }
 
-fn post_request(path: String, body: String) -> Result(String, String) {
+fn post_request(
+  path: String,
+  body: String,
+  auth_user: Option(String),
+) -> Result(String, String) {
   let req =
     request.new()
     |> request.set_method(http.Post)
@@ -802,6 +808,11 @@ fn post_request(path: String, body: String) -> Result(String, String) {
     |> request.set_path(path)
     |> request.set_body(body)
     |> request.set_header("content-type", "application/x-www-form-urlencoded")
+
+  let req = case auth_user {
+    Some(u) -> request.set_header(req, "authorization", "Username " <> u)
+    None -> req
+  }
 
   case httpc.send(req) {
     Ok(resp) ->
@@ -819,7 +830,10 @@ fn post_request(path: String, body: String) -> Result(String, String) {
   }
 }
 
-fn get_request(path: String) -> Result(String, String) {
+fn get_request(
+  path: String,
+  auth_user: Option(String),
+) -> Result(String, String) {
   let req =
     request.new()
     |> request.set_method(http.Get)
@@ -827,6 +841,11 @@ fn get_request(path: String) -> Result(String, String) {
     |> request.set_host(api_host)
     |> request.set_port(api_port)
     |> request.set_path(path)
+
+  let req = case auth_user {
+    Some(u) -> request.set_header(req, "authorization", "Username " <> u)
+    None -> req
+  }
 
   case httpc.send(req) {
     Ok(resp) ->
@@ -838,7 +857,11 @@ fn get_request(path: String) -> Result(String, String) {
   }
 }
 
-fn put_request(path: String, body: String) -> Result(String, String) {
+fn put_request(
+  path: String,
+  body: String,
+  auth_user: Option(String),
+) -> Result(String, String) {
   let req =
     request.new()
     |> request.set_method(http.Put)
@@ -848,6 +871,11 @@ fn put_request(path: String, body: String) -> Result(String, String) {
     |> request.set_path(path)
     |> request.set_body(body)
     |> request.set_header("content-type", "application/x-www-form-urlencoded")
+
+  let req = case auth_user {
+    Some(u) -> request.set_header(req, "authorization", "Username " <> u)
+    None -> req
+  }
 
   case httpc.send(req) {
     Ok(resp) ->

@@ -89,6 +89,21 @@ fn get_form_params(
   list.try_map(param_names, fn(name) { list.key_find(formdata.values, name) })
 }
 
+fn require_auth(
+  req: wisp.Request,
+  next: fn(String) -> wisp.Response,
+) -> wisp.Response {
+  case list.key_find(req.headers, "authorization") {
+    Ok(header) -> {
+      case string.split(header, " ") {
+        ["Username", username] -> next(username)
+        _ -> wisp.response(401)
+      }
+    }
+    Error(_) -> wisp.response(401)
+  }
+}
+
 pub fn handle_request(
   req: wisp.Request,
   engine_inbox: process.Subject(EngineMessage),
@@ -136,13 +151,15 @@ pub fn handle_request(
 
     // POST /subreddits
     // Creates a new subreddit.
-    // Body: "username", "title", "description"
+    // Headers: Authorization: Username <username>
+    // Body: "title", "description"
     ["subreddits"] -> {
       use <- wisp.require_method(req, Post)
+      use username <- require_auth(req)
       use formdata <- wisp.require_form(req)
 
-      case get_form_params(formdata, ["username", "title", "description"]) {
-        Ok([username, title, description]) -> {
+      case get_form_params(formdata, ["title", "description"]) {
+        Ok([title, description]) -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
               CreateSubreddit(username, title, description, r)
@@ -173,140 +190,156 @@ pub fn handle_request(
     // Gets a user's feed.
     ["users", username, "feed"] -> {
       use <- wisp.require_method(req, Get)
-      let result =
-        process.call(engine_inbox, 1000, fn(r) { GetFeed(username, r) })
+      use auth_user <- require_auth(req)
 
-      case result {
-        Ok(posts) -> {
-          let posts_to_json = fn(posts: List(#(SubredditId, Post))) -> String {
-            json.object([
-              #(
-                "posts",
-                json.array(
-                  list.map(posts, fn(post) {
-                    [
-                      #("subreddit_id", json.string(post.0)),
-                      #("title", json.string({ post.1 }.title)),
-                      #("content", json.string({ post.1 }.content)),
-                      #("author", json.string({ post.1 }.author)),
-                      #("upvote", json.int({ post.1 }.upvote)),
-                      #("downvote", json.int({ post.1 }.downvote)),
-                      #(
-                        "comments",
-                        json.array(
-                          dict.values({ post.1 }.comments),
-                          fn(comment) {
-                            json.object([
-                              #("content", json.string(comment.content)),
-                              #("author", json.string(comment.author)),
-                              #("upvote", json.int(comment.upvote)),
-                              #("downvote", json.int(comment.downvote)),
-                              #(
-                                "timestamp",
-                                json.float(
-                                  comment.timestamp |> timestamp.to_unix_seconds,
-                                ),
-                              ),
-                            ])
-                          },
-                        ),
-                      ),
-                      #("upvote", json.int({ post.1 }.upvote)),
-                      #("downvote", json.int({ post.1 }.downvote)),
-                      #(
-                        "timestamp",
-                        json.float(
-                          { post.1 }.timestamp |> timestamp.to_unix_seconds,
-                        ),
-                      ),
-                    ]
-                  }),
-                  of: json.object,
-                ),
-              ),
-            ])
-            |> json.to_string
+      // Validate that the authenticated user is requesting their own feed
+      case auth_user == username {
+        True -> {
+          let result =
+            process.call(engine_inbox, 1000, fn(r) { GetFeed(username, r) })
+
+          case result {
+            Ok(posts) -> {
+              let posts_to_json = fn(posts: List(#(SubredditId, Post))) -> String {
+                json.object([
+                  #(
+                    "posts",
+                    json.array(
+                      list.map(posts, fn(post) {
+                        [
+                          #("subreddit_id", json.string(post.0)),
+                          #("title", json.string({ post.1 }.title)),
+                          #("content", json.string({ post.1 }.content)),
+                          #("author", json.string({ post.1 }.author)),
+                          #("upvote", json.int({ post.1 }.upvote)),
+                          #("downvote", json.int({ post.1 }.downvote)),
+                          #(
+                            "comments",
+                            json.array(
+                              dict.values({ post.1 }.comments),
+                              fn(comment) {
+                                json.object([
+                                  #("content", json.string(comment.content)),
+                                  #("author", json.string(comment.author)),
+                                  #("upvote", json.int(comment.upvote)),
+                                  #("downvote", json.int(comment.downvote)),
+                                  #(
+                                    "timestamp",
+                                    json.float(
+                                      comment.timestamp
+                                      |> timestamp.to_unix_seconds,
+                                    ),
+                                  ),
+                                ])
+                              },
+                            ),
+                          ),
+                          #("upvote", json.int({ post.1 }.upvote)),
+                          #("downvote", json.int({ post.1 }.downvote)),
+                          #(
+                            "timestamp",
+                            json.float(
+                              { post.1 }.timestamp |> timestamp.to_unix_seconds,
+                            ),
+                          ),
+                        ]
+                      }),
+                      of: json.object,
+                    ),
+                  ),
+                ])
+                |> json.to_string
+              }
+
+              wisp.json_response(posts_to_json(posts), 200)
+            }
+
+            Error(msg) ->
+              wisp.json_response(
+                json.to_string(json.object([#("error", json.string(msg))])),
+                404,
+              )
           }
-
-          wisp.json_response(posts_to_json(posts), 200)
         }
-
-        Error(msg) ->
-          wisp.json_response(
-            json.to_string(json.object([#("error", json.string(msg))])),
-            404,
-          )
+        False -> wisp.response(403)
       }
     }
 
     // PUT/DELETE /users/{username}/subscriptions/{subreddit_id}
     // Joins or leaves a subreddit.
     ["users", username, "subscriptions", subreddit_id] -> {
-      case req.method {
-        Put -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) {
-              JoinSubreddit(username, subreddit_id, r)
-            })
-          case result {
-            Ok(msg) ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("message", json.string(msg)),
-                  ]),
-                ),
-                200,
-              )
-            Error(err) ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("error", json.string(err)),
-                  ]),
-                ),
-                400,
-              )
+      use auth_user <- require_auth(req)
+      case auth_user == username {
+        True -> {
+          case req.method {
+            Put -> {
+              let result =
+                process.call(engine_inbox, 1000, fn(r) {
+                  JoinSubreddit(username, subreddit_id, r)
+                })
+              case result {
+                Ok(msg) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("message", json.string(msg)),
+                      ]),
+                    ),
+                    200,
+                  )
+                Error(err) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("error", json.string(err)),
+                      ]),
+                    ),
+                    400,
+                  )
+              }
+            }
+            Delete -> {
+              let result =
+                process.call(engine_inbox, 1000, fn(r) {
+                  LeaveSubreddit(username, subreddit_id, r)
+                })
+              case result {
+                Ok(msg) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("message", json.string(msg)),
+                      ]),
+                    ),
+                    200,
+                  )
+                Error(err) ->
+                  wisp.json_response(
+                    json.to_string(
+                      json.object([
+                        #("error", json.string(err)),
+                      ]),
+                    ),
+                    400,
+                  )
+              }
+            }
+            _ -> wisp.method_not_allowed([Put, Delete])
           }
         }
-        Delete -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) {
-              LeaveSubreddit(username, subreddit_id, r)
-            })
-          case result {
-            Ok(msg) ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("message", json.string(msg)),
-                  ]),
-                ),
-                200,
-              )
-            Error(err) ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("error", json.string(err)),
-                  ]),
-                ),
-                400,
-              )
-          }
-        }
-        _ -> wisp.method_not_allowed([Put, Delete])
+        False -> wisp.response(403)
       }
     }
 
     // POST /subreddits/{subreddit_id}/posts/{post_id}/comments
     // Comments on a post.
-    // Body: "username", "content"
+    // Body: "content"
     ["subreddits", subreddit_id, "posts", post_id_str, "comments"] -> {
       use <- wisp.require_method(req, Post)
+      use username <- require_auth(req)
       use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["username", "content"]) {
-        Ok([username, content]) -> {
+      case get_form_params(formdata, ["content"]) {
+        Ok([content]) -> {
           case uri.percent_decode(post_id_str) {
             Ok(post_id_str) -> {
               case bit_array.base64_decode(post_id_str) {
@@ -357,20 +390,20 @@ pub fn handle_request(
 
     // POST /comments/{parent_comment_id}/replies
     // Replies to a comment.
-    // Body: "username", "subreddit", "post_id", "content"
+    // Body: "subreddit", "post_id", "content"
     ["comments", parent_comment_id_str, "replies"] -> {
       use <- wisp.require_method(req, Post)
+      use username <- require_auth(req)
       use formdata <- wisp.require_form(req)
 
       case
         get_form_params(formdata, [
-          "username",
           "subreddit",
           "post_id",
           "content",
         ])
       {
-        Ok([username, subreddit, post_id_str, content]) -> {
+        Ok([subreddit, post_id_str, content]) -> {
           case uri.percent_decode(parent_comment_id_str) {
             Ok(parent_comment_id_str) -> {
               case
@@ -433,15 +466,15 @@ pub fn handle_request(
 
     // POST /posts/{post_id}/votes
     // Votes on a post.
-    // Body: "username", "subreddit", "vote" ("upvote" or "downvote")
+    // Body: "subreddit", "vote" ("upvote" or "downvote")
     ["posts", post_id_str, "votes"] -> {
       use <- wisp.require_method(req, Post)
+      use username <- require_auth(req)
       use formdata <- wisp.require_form(req)
-      let username_r = list.key_find(formdata.values, "username")
       let subreddit_r = list.key_find(formdata.values, "subreddit")
       let vote_r = list.key_find(formdata.values, "vote")
-      case username_r, subreddit_r, vote_r {
-        Ok(username), Ok(subreddit), Ok(vote) -> {
+      case subreddit_r, vote_r {
+        Ok(subreddit), Ok(vote) -> {
           let vote_type = case vote {
             "upvote" -> Upvote
             "downvote" -> Downvote
@@ -482,18 +515,19 @@ pub fn handle_request(
             Error(_) -> wisp.bad_request("Invalid post id")
           }
         }
-        _, _, _ -> wisp.bad_request("Form parameters are invalid")
+        _, _ -> wisp.bad_request("Form parameters are invalid")
       }
     }
 
     // POST /dms
     // Sends a direct message.
-    // Body: "from", "to", "content"
+    // Body: "to", "content"
     ["dms"] -> {
       use <- wisp.require_method(req, Post)
+      use from <- require_auth(req)
       use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["from", "to", "content"]) {
-        Ok([from, to, content]) -> {
+      case get_form_params(formdata, ["to", "content"]) {
+        Ok([to, content]) -> {
           let result =
             process.call(engine_inbox, 1000, fn(r) {
               SendDirectMessage(from, to, content, r)
@@ -509,12 +543,13 @@ pub fn handle_request(
 
     // POST /subreddits/{subreddit_id}/posts
     // Creates a new post.
-    // Body: "username", "title", "content"
+    // Body: "title", "content"
     ["subreddits", subreddit_id, "posts"] -> {
       use <- wisp.require_method(req, Post)
+      use username <- require_auth(req)
       use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["username", "title", "content"]) {
-        Ok([username, title, content]) -> {
+      case get_form_params(formdata, ["title", "content"]) {
+        Ok([title, content]) -> {
           let post_id =
             process.call(engine_inbox, 1000, fn(r) {
               CreatePostWithReply(
@@ -551,42 +586,51 @@ pub fn handle_request(
     // Gets a user's direct messages.
     ["users", username, "dms"] -> {
       use <- wisp.require_method(req, Get)
-      let dms_result =
-        process.call(engine_inbox, 1000, fn(r) {
-          GetDirectMessages(username, r)
-        })
+      use auth_user <- require_auth(req)
 
-      case dms_result {
-        Ok(dms) -> {
-          let dms_to_json = fn(dms: List(DirectMessage)) -> String {
-            json.object([
-              #(
-                "dms",
-                json.array(
-                  list.map(dms, fn(dm) {
-                    [
-                      #("from", json.string(dm.from)),
-                      #("to", json.string(dm.to)),
-                      #("content", json.string(dm.content)),
-                      #(
-                        "timestamp",
-                        json.float(dm.timestamp |> timestamp.to_unix_seconds),
-                      ),
-                    ]
-                  }),
-                  of: json.object,
-                ),
-              ),
-            ])
-            |> json.to_string
+      case auth_user == username {
+        True -> {
+          let dms_result =
+            process.call(engine_inbox, 1000, fn(r) {
+              GetDirectMessages(username, r)
+            })
+
+          case dms_result {
+            Ok(dms) -> {
+              let dms_to_json = fn(dms: List(DirectMessage)) -> String {
+                json.object([
+                  #(
+                    "dms",
+                    json.array(
+                      list.map(dms, fn(dm) {
+                        [
+                          #("from", json.string(dm.from)),
+                          #("to", json.string(dm.to)),
+                          #("content", json.string(dm.content)),
+                          #(
+                            "timestamp",
+                            json.float(
+                              dm.timestamp |> timestamp.to_unix_seconds,
+                            ),
+                          ),
+                        ]
+                      }),
+                      of: json.object,
+                    ),
+                  ),
+                ])
+                |> json.to_string
+              }
+              wisp.json_response(dms_to_json(dms), 200)
+            }
+            Error(err) ->
+              wisp.json_response(
+                json.to_string(json.object([#("error", json.string(err))])),
+                400,
+              )
           }
-          wisp.json_response(dms_to_json(dms), 200)
         }
-        Error(err) ->
-          wisp.json_response(
-            json.to_string(json.object([#("error", json.string(err))])),
-            400,
-          )
+        False -> wisp.response(403)
       }
     }
 
@@ -594,9 +638,11 @@ pub fn handle_request(
     // Gets a user's karma.
     ["users", username, "karma"] -> {
       use <- wisp.require_method(req, Get)
+      use sender_username <- require_auth(req)
+
       let karma_result =
         process.call(engine_inbox, 1000, fn(r) {
-          GetKarma("api_user", username, r)
+          GetKarma(sender_username, username, r)
         })
 
       case karma_result {
