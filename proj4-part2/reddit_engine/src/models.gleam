@@ -102,7 +102,7 @@ pub type EngineMessage {
   )
   GetSubredditMemberCount(
     subreddit_id: SubredditId,
-    reply_to: process.Subject(Int),
+    reply_to: process.Subject(Result(Int, String)),
   )
   GetEngineMetrics(reply_to: process.Subject(PerformanceMetrics))
   RefreshEngineMetrics

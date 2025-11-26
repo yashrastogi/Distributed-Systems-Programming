@@ -110,13 +110,13 @@ pub fn get_engine_metrics(
 pub fn get_subreddit_member_count(
   state: models.EngineState,
   subreddit_id: SubredditId,
-  reply_to: process.Subject(Int),
+  reply_to: process.Subject(Result(Int, String)),
 ) -> models.EngineState {
   printi("Requesting member count for r/" <> subreddit_id)
   // Retrieve subreddit and count subscribers
   let member_count = case dict.get(state.subreddits, subreddit_id) {
-    Ok(subreddit) -> set.size(subreddit.subscribers)
-    Error(_) -> 0
+    Ok(subreddit) -> Ok(set.size(subreddit.subscribers))
+    Error(_) -> Error("Subreddit not found")
   }
   process.send(reply_to, member_count)
   state
@@ -291,63 +291,60 @@ pub fn create_post_with_reply(
       process.send(reply_to, Error("Invalid user"))
       state
     }
-    True -> {
-      // Generate a unique ID and create the new post
-      let new_post =
-        models.Post(
-          id: models.uuid_gen(),
-          title: title,
-          content: content,
-          author: username,
-          comments: dict.new(),
-          upvote: 0,
-          downvote: 0,
-          timestamp: timestamp.system_time(),
-          signature: signature,
-        )
 
-      // Send the post_id back to the requester
-      process.send(reply_to, Ok(new_post.id))
+    True ->
+      case dict.get(state.subreddits, subreddit_id) {
+        Error(_) -> {
+          printi(
+            "⚠ Subreddit r/" <> subreddit_id <> " not found for post creation",
+          )
+          process.send(reply_to, Error("Subreddit not found"))
+          state
+        }
+        Ok(_) -> {
+          // Generate a unique ID and create the new post
+          let new_post =
+            models.Post(
+              id: models.uuid_gen(),
+              title: title,
+              content: content,
+              author: username,
+              comments: dict.new(),
+              upvote: 0,
+              downvote: 0,
+              timestamp: timestamp.system_time(),
+              signature: signature,
+            )
 
-      // Add the post to the subreddit
-      let updated_subreddits =
-        dict.upsert(state.subreddits, subreddit_id, fn(subreddit_op) {
-          case subreddit_op {
-            Some(subreddit) ->
-              models.Subreddit(
-                ..subreddit,
-                posts: list.prepend(subreddit.posts, new_post),
-              )
-            None -> {
-              printi(
-                "⚠ Subreddit r/"
-                <> subreddit_id
-                <> " not found for post creation",
-              )
-              models.Subreddit(
-                name: subreddit_id,
-                description: "",
-                subscribers: set.new(),
-                posts: [new_post],
-              )
-            }
-          }
-        })
+          // Send the post_id back to the requester
+          process.send(reply_to, Ok(new_post.id))
 
-      models.EngineState(
-        ..state,
-        subreddits: updated_subreddits,
-        metrics: models.PerformanceMetrics(
-          ..state.metrics,
-          total_posts: state.metrics.total_posts
-            + bool.lazy_guard(
-              when: updated_subreddits == state.subreddits,
-              return: fn() { 0 },
-              otherwise: fn() { 1 },
+          // Add the post to the subreddit
+          let assert Ok(existing_subreddit) =
+            dict.get(state.subreddits, subreddit_id)
+          let updated_subreddit =
+            models.Subreddit(
+              ..existing_subreddit,
+              posts: list.prepend(existing_subreddit.posts, new_post),
+            )
+          let updated_subreddits =
+            dict.insert(state.subreddits, subreddit_id, updated_subreddit)
+
+          models.EngineState(
+            ..state,
+            subreddits: updated_subreddits,
+            metrics: models.PerformanceMetrics(
+              ..state.metrics,
+              total_posts: state.metrics.total_posts
+                + bool.lazy_guard(
+                  when: updated_subreddits == state.subreddits,
+                  return: fn() { 0 },
+                  otherwise: fn() { 1 },
+                ),
             ),
-        ),
-      )
-    }
+          )
+        }
+      }
   }
 }
 
@@ -675,79 +672,51 @@ pub fn leave_subreddit(
 ) -> models.EngineState {
   printi(username <> " is leaving subreddit " <> subreddit_name)
 
-  case dict.has_key(state.users, username) {
-    False -> {
-      process.send(reply_to, Error("Invalid user"))
+  case dict.get(state.users, username) {
+    Error(_) -> {
+      process.send(reply_to, Error("User not found"))
       state
     }
-    True -> {
-      let updated_users =
-        dict.upsert(state.users, username, fn(user_op) {
-          case user_op {
-            Some(user) ->
-              models.User(
-                ..user,
-                subscribed_subreddits: set.delete(
-                  user.subscribed_subreddits,
-                  subreddit_name,
-                ),
-              )
+    Ok(user) -> {
+      let updated_user =
+        models.User(
+          ..user,
+          subscribed_subreddits: set.delete(
+            user.subscribed_subreddits,
+            subreddit_name,
+          ),
+        )
+      let updated_users = dict.insert(state.users, username, updated_user)
 
-            None -> {
-              printi(
-                "⚠ User " <> username <> " not found for leaving subreddit",
-              )
-              user_op
-              |> option.unwrap(models.User(
-                username: username,
-                upvotes: 0,
-                downvotes: 0,
-                subscribed_subreddits: set.new(),
-                inbox: [],
-                public_key: None,
-              ))
-            }
+      case dict.get(state.subreddits, subreddit_name) {
+        Error(_) -> {
+          process.send(reply_to, Error("Subreddit not found"))
+          models.EngineState(..state, users: updated_users)
+        }
+        Ok(subreddit) -> {
+          let updated_subreddit =
+            models.Subreddit(
+              ..subreddit,
+              subscribers: set.delete(subreddit.subscribers, username),
+            )
+          let updated_subreddits =
+            dict.insert(state.subreddits, subreddit_name, updated_subreddit)
+
+          let success =
+            updated_users != state.users
+            || updated_subreddits != state.subreddits
+          case success {
+            True -> process.send(reply_to, Ok("Left subreddit successfully"))
+            False -> process.send(reply_to, Error("Failed to leave subreddit"))
           }
-        })
 
-      let updated_subreddits =
-        dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
-          case sub_op {
-            Some(subreddit) ->
-              models.Subreddit(
-                ..subreddit,
-                subscribers: set.delete(subreddit.subscribers, username),
-              )
-
-            None -> {
-              printi(
-                "⚠ Subreddit r/" <> subreddit_name <> " not found for leaving",
-              )
-              sub_op
-              |> option.unwrap(
-                models.Subreddit(
-                  name: subreddit_name,
-                  description: "",
-                  subscribers: set.new(),
-                  posts: [],
-                ),
-              )
-            }
-          }
-        })
-
-      let success =
-        updated_users != state.users || updated_subreddits != state.subreddits
-      case success {
-        True -> process.send(reply_to, Ok("Left subreddit successfully"))
-        False -> process.send(reply_to, Error("Failed to leave subreddit"))
+          models.EngineState(
+            ..state,
+            users: updated_users,
+            subreddits: updated_subreddits,
+          )
+        }
       }
-
-      models.EngineState(
-        ..state,
-        users: updated_users,
-        subreddits: updated_subreddits,
-      )
     }
   }
 }
@@ -760,79 +729,52 @@ pub fn join_subreddit(
 ) -> models.EngineState {
   printi(username <> " is joining r/" <> subreddit_name)
 
-  case dict.has_key(state.users, username) {
-    False -> {
-      process.send(reply_to, Error("Invalid user"))
+  case dict.get(state.users, username) {
+    Error(_) -> {
+      process.send(reply_to, Error("User not found"))
       state
     }
-    True -> {
+    Ok(user) -> {
       // Add subreddit to user's subscriptions
-      let updated_users =
-        dict.upsert(state.users, username, fn(user_op) {
-          case user_op {
-            Some(user) ->
-              models.User(
-                ..user,
-                subscribed_subreddits: set.insert(
-                  user.subscribed_subreddits,
-                  subreddit_name,
-                ),
-              )
-
-            None -> {
-              printi(
-                "⚠ User " <> username <> " not found for joining subreddit",
-              )
-              user_op
-              |> option.unwrap(models.User(
-                username: username,
-                upvotes: 0,
-                downvotes: 0,
-                subscribed_subreddits: set.from_list([subreddit_name]),
-                inbox: [],
-                public_key: None,
-              ))
-            }
-          }
-        })
+      let updated_user =
+        models.User(
+          ..user,
+          subscribed_subreddits: set.insert(
+            user.subscribed_subreddits,
+            subreddit_name,
+          ),
+        )
+      let updated_users = dict.insert(state.users, username, updated_user)
 
       // Add user to subreddit's subscriber list
-      let updated_subreddits =
-        dict.upsert(state.subreddits, subreddit_name, fn(sub_op) {
-          case sub_op {
-            Some(subreddit) ->
-              models.Subreddit(
-                ..subreddit,
-                subscribers: set.insert(subreddit.subscribers, username),
-              )
+      case dict.get(state.subreddits, subreddit_name) {
+        Error(_) -> {
+          process.send(reply_to, Error("Subreddit not found"))
+          models.EngineState(..state, users: updated_users)
+        }
+        Ok(subreddit) -> {
+          let updated_subreddit =
+            models.Subreddit(
+              ..subreddit,
+              subscribers: set.insert(subreddit.subscribers, username),
+            )
+          let updated_subreddits =
+            dict.insert(state.subreddits, subreddit_name, updated_subreddit)
 
-            None -> {
-              printi(
-                "⚠ Subreddit r/" <> subreddit_name <> " not found for joining",
-              )
-              sub_op
-              |> option.unwrap(
-                models.Subreddit(
-                  name: subreddit_name,
-                  description: "",
-                  subscribers: set.from_list([username]),
-                  posts: [],
-                ),
-              )
-            }
+          let success =
+            updated_users != state.users
+            || updated_subreddits != state.subreddits
+          case success {
+            True -> process.send(reply_to, Ok("Joined subreddit successfully"))
+            False -> process.send(reply_to, Error("Failed to join subreddit"))
           }
-        })
-      let success =
-        updated_users != state.users || updated_subreddits != state.subreddits
-      case success {
-        True -> process.send(reply_to, Ok("Joined subreddit successfully"))
-        False -> process.send(reply_to, Error("Failed to join subreddit"))
+          models.EngineState(
+            ..state,
+            users: updated_users,
+            subreddits: updated_subreddits,
+          )
+        }
       }
-      models.EngineState(
-        ..state,
-        users: updated_users,
-        subreddits: updated_subreddits,
-      )
     }
   }
 }

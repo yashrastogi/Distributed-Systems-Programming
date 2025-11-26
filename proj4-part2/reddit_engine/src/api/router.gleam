@@ -740,10 +740,19 @@ pub fn handle_request(
           models.GetSubredditMemberCount(subreddit_id, r)
         })
 
-      wisp.json_response(
-        json.to_string(json.object([#("member_count", json.int(count))])),
-        200,
-      )
+      case count {
+        Ok(count) ->
+          wisp.json_response(
+            json.to_string(json.object([#("member_count", json.int(count))])),
+            200,
+          )
+
+        Error(msg) ->
+          wisp.json_response(
+            json.to_string(json.object([#("error", json.string(msg))])),
+            400,
+          )
+      }
     }
 
     // GET /metrics
