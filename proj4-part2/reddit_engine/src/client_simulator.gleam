@@ -8,13 +8,14 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/timestamp
 import gleam/uri
 import models.{type PerformanceMetrics}
 
-const total_users = 10_000
+const clients = 9999
 
 const api_host = "192.168.139.3"
 
@@ -38,7 +39,7 @@ pub fn main() {
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
   io.println(
     "Simulating "
-    <> int.to_string(total_users)
+    <> int.to_string(clients)
     <> " users with realistic behavior patterns\n",
   )
 
@@ -69,7 +70,7 @@ fn start_post_tracker() -> process.Subject(PostTrackingMessage) {
   })
 
   // Wait for the subject from the spawned process
-  let assert Ok(subject) = process.receive(parent_subject, 1000)
+  let assert Ok(subject) = process.receive(parent_subject, 10_000)
   subject
 }
 
@@ -78,7 +79,7 @@ fn post_tracker_loop(
   posts: List(#(String, String)),
   comments: List(#(String, String, String)),
 ) {
-  case process.receive(subject, 10) {
+  case process.receive(subject, 10_000) {
     Ok(AddPost(subreddit, post_id)) -> {
       post_tracker_loop(subject, [#(subreddit, post_id), ..posts], comments)
     }
@@ -136,10 +137,10 @@ fn run_simulation(post_tracker: process.Subject(PostTrackingMessage)) {
 
   // Spawn user actors - each runs independently
   let user_pids =
-    list.range(1, total_users)
+    list.range(1, clients)
     |> list.map(fn(i) {
       let username = "user" <> int.to_string(i)
-      let is_power_user = i <= total_users / 10
+      let is_power_user = i <= clients / 10
 
       // Spawn each user as a separate process
       let user_pid =
@@ -161,7 +162,7 @@ fn run_simulation(post_tracker: process.Subject(PostTrackingMessage)) {
   io.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
   // Let the simulation run for a while
-  wait_for_completions(completion_subject, total_users, 0)
+  wait_for_completions(completion_subject, clients, 0)
 
   // Report subreddit membership distribution
   io.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -434,7 +435,7 @@ fn perform_online_activities(
         let reply_subject = process.new_subject()
         process.send(post_tracker, GetRandomPost(reply_subject))
 
-        case process.receive(reply_subject, 100) {
+        case process.receive(reply_subject, 10_000) {
           Ok(Ok(#(subreddit, post_id))) -> {
             case
               comment_on_post(
@@ -471,7 +472,7 @@ fn perform_online_activities(
         let reply_subject = process.new_subject()
         process.send(post_tracker, GetRandomComment(reply_subject))
 
-        case process.receive(reply_subject, 100) {
+        case process.receive(reply_subject, 10_000) {
           Ok(Ok(#(subreddit, post_id, comment_id))) -> {
             case
               comment_on_comment(
@@ -509,7 +510,7 @@ fn perform_online_activities(
 
       // 20% Send direct message
       5 | 6 -> {
-        let recipient = "user" <> int.to_string(int.random(total_users) + 1)
+        let recipient = "user" <> int.to_string(int.random(clients) + 1)
 
         let _ =
           send_direct_message(username, recipient, "Hey! How are you doing?")
@@ -521,7 +522,7 @@ fn perform_online_activities(
         let reply_subject = process.new_subject()
         process.send(post_tracker, GetRandomPost(reply_subject))
 
-        case process.receive(reply_subject, 100) {
+        case process.receive(reply_subject, 10_000) {
           Ok(Ok(#(subreddit, post_id))) -> {
             let vote = case int.random(2) {
               0 -> "upvote"
@@ -642,8 +643,6 @@ fn select_by_cumulative_probability(
     }
   }
 }
-
-import gleam/option.{type Option, None, Some}
 
 // HTTP API Helpers
 
@@ -781,9 +780,14 @@ fn get_subreddit_member_count(subreddit: String) -> Result(Int, String) {
     )
   {
     Ok(body) -> {
-      case int.parse(body) {
-        Ok(i) -> Ok(i)
-        Error(_) -> Error("Failed to parse member count")
+      let decoder = {
+        use member_count <- decode.field("member_count", decode.int)
+        decode.success(member_count)
+      }
+
+      case json.parse(body, decoder) {
+        Ok(count) -> Ok(count)
+        Error(_) -> Error("Failed to decode member count JSON")
       }
     }
     Error(e) -> Error(e)

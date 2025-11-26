@@ -1,5 +1,6 @@
 import gleam/crypto
 import gleam/dict.{type Dict}
+import gleam/erlang/process
 import gleam/option.{type Option}
 import gleam/set.{type Set}
 import gleam/time/timestamp.{type Timestamp}
@@ -11,7 +12,109 @@ pub type User {
     downvotes: Int,
     subscribed_subreddits: Set(SubredditId),
     inbox: List(DirectMessage),
+    public_key: Option(PublicKeyRsa2048),
   )
+}
+
+pub type EngineState {
+  EngineState(
+    self_subject: process.Subject(EngineMessage),
+    users: Dict(Username, User),
+    subreddits: Dict(SubredditId, Subreddit),
+    metrics: PerformanceMetrics,
+  )
+}
+
+pub type EngineMessage {
+  UserRegister(
+    username: Username,
+    public_key: Option(PublicKeyRsa2048),
+    reply_to: process.Subject(Bool),
+  )
+  CreateSubreddit(
+    username: Username,
+    name: SubredditId,
+    description: String,
+    reply_to: process.Subject(Result(String, String)),
+  )
+  JoinSubreddit(
+    username: Username,
+    subreddit_name: SubredditId,
+    reply_to: process.Subject(Result(String, String)),
+  )
+  LeaveSubreddit(
+    username: Username,
+    subreddit_name: SubredditId,
+    reply_to: process.Subject(Result(String, String)),
+  )
+  CreatePostWithReply(
+    username: Username,
+    subreddit_id: SubredditId,
+    signature: Option(String),
+    content: String,
+    title: String,
+    reply_to: process.Subject(Result(PostId, String)),
+  )
+  CommentOnPost(
+    username: Username,
+    subreddit_id: SubredditId,
+    post_id: PostId,
+    content: String,
+    reply_to: process.Subject(Result(CommentId, String)),
+  )
+  CommentOnComment(
+    username: Username,
+    subreddit_id: SubredditId,
+    post_id: PostId,
+    parent_comment_id: CommentId,
+    content: String,
+    reply_to: process.Subject(Result(CommentId, String)),
+  )
+  VotePost(
+    subreddit_id: SubredditId,
+    username: Username,
+    post_id: PostId,
+    vote: VoteType,
+    reply_to: process.Subject(Result(String, String)),
+  )
+  GetFeed(
+    username: Username,
+    reply_to: process.Subject(Result(List(#(SubredditId, Post)), String)),
+  )
+  GetDirectMessages(
+    username: Username,
+    reply_to: process.Subject(Result(List(DirectMessage), String)),
+  )
+  SendDirectMessage(
+    from_username: Username,
+    to_username: Username,
+    content: String,
+    reply_to: process.Subject(Result(String, String)),
+  )
+  GetPublicKey(
+    username: Username,
+    reply_to: process.Subject(Result(Option(PublicKeyRsa2048), String)),
+  )
+  GetKarma(
+    sender_username: Username,
+    username: Username,
+    reply_to: process.Subject(Result(Int, String)),
+  )
+  GetSubredditMemberCount(
+    subreddit_id: SubredditId,
+    reply_to: process.Subject(Int),
+  )
+  GetEngineMetrics(reply_to: process.Subject(PerformanceMetrics))
+  RefreshEngineMetrics
+  SearchUsers(query: String, reply_to: process.Subject(List(Username)))
+  SearchSubreddits(
+    query: String,
+    reply_to: process.Subject(List(#(SubredditId, String))),
+  )
+}
+
+pub type PublicKeyRsa2048 {
+  PublicKeyRsa2048(key_value: String)
 }
 
 pub type DirectMessage {
@@ -42,6 +145,7 @@ pub type Post {
     content: String,
     author: Username,
     comments: Dict(CommentId, Comment),
+    signature: Option(String),
     upvote: Int,
     downvote: Int,
     timestamp: Timestamp,

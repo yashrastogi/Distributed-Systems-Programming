@@ -1,948 +1,50 @@
-import gleam/bit_array
+import api/router
 import gleam/bool
-import gleam/dict.{type Dict}
+import gleam/dict
 import gleam/erlang/process
 import gleam/float
-import gleam/http.{Delete, Get, Post, Put}
 import gleam/int
 import gleam/io
-import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/set
 import gleam/string
 import gleam/time/duration
 import gleam/time/timestamp
-import gleam/uri
-import middleware
 import mist
 import models.{
-  type CommentId, type DirectMessage, type PerformanceMetrics, type Post,
-  type PostId, type Subreddit, type SubredditId, type User, type Username,
-  type VoteType, Downvote, Upvote,
+  type CommentId, type DirectMessage, type EngineMessage,
+  type PerformanceMetrics, type Post, type PostId, type SubredditId,
+  type Username, type VoteType, Downvote, RefreshEngineMetrics, Upvote,
 }
 import wisp
 import wisp/wisp_mist
 
 const log_info = True
 
-pub fn main() -> Nil {
-  wisp.configure_logger()
-
-  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-  printi("       Reddit Engine Starting Up")
-  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-
-  // Initialize and start the actor with named subject
-  let assert Ok(engine_actor) =
-    actor.new_with_initialiser(1000, fn(self_sub) {
-      EngineState(
-        self_subject: self_sub,
-        users: dict.new(),
-        subreddits: dict.new(),
-        metrics: models.PerformanceMetrics(
-          total_users: 0,
-          total_posts: 0,
-          total_comments: 0,
-          total_votes: 0,
-          total_messages: 0,
-          simulation_start_time: timestamp.system_time(),
-          simulation_checkpoint_time: timestamp.system_time(),
-          posts_per_second: 0.0,
-          messages_per_second: 0.0,
-        ),
-      )
-      |> actor.initialised
-      |> actor.returning(self_sub)
-      |> Ok
-    })
-    |> actor.on_message(engine_message_handler)
-    |> actor.start
-
-  process.send(engine_actor.data, RefreshEngineMetrics)
-  printi("✓ Reddit engine actor started")
-
-  // Start web server
-  let assert Ok(_) =
-    wisp_mist.handler(
-      fn(req) { handle_request(req, engine_actor.data) },
-      wisp.random_string(64),
-    )
-    |> mist.new
-    |> mist.bind("0.0.0.0")
-    |> mist.port(8080)
-    |> mist.start
-
-  printi("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-  printi("  Engine ready - waiting for messages")
-  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-
-  process.sleep_forever()
-  Nil
-}
-
-fn get_form_params(
-  formdata: wisp.FormData,
-  param_names: List(String),
-) -> Result(List(String), Nil) {
-  list.try_map(param_names, fn(name) { list.key_find(formdata.values, name) })
-}
-
-fn require_auth(
-  req: wisp.Request,
-  next: fn(String) -> wisp.Response,
-) -> wisp.Response {
-  case list.key_find(req.headers, "authorization") {
-    Ok(header) -> {
-      case string.split(header, " ") {
-        ["Username", username] -> next(username)
-        _ -> wisp.response(401)
-      }
+pub fn get_public_key(
+  state: models.EngineState,
+  username: Username,
+  reply_to: process.Subject(Result(Option(models.PublicKeyRsa2048), String)),
+) -> models.EngineState {
+  printi("Requesting public key for user: " <> username)
+  case dict.get(state.users, username) {
+    Ok(user) -> {
+      process.send(reply_to, Ok(user.public_key))
     }
-    Error(_) -> wisp.response(401)
+    Error(_) -> {
+      process.send(reply_to, Error("User not found"))
+    }
   }
-}
-
-pub fn handle_request(
-  req: wisp.Request,
-  engine_inbox: process.Subject(EngineMessage),
-) -> wisp.Response {
-  use req <- middleware.middleware(req)
-  case wisp.path_segments(req) {
-    [] -> wisp.ok() |> wisp.html_body("<h1>Reddit Engine running.</h1>")
-
-    // POST /users
-    // Registers a new user.
-    // Body: "username"
-    ["users"] -> {
-      use <- wisp.require_method(req, Post)
-      use formdata <- wisp.require_form(req)
-
-      let username_r = list.key_find(formdata.values, "username")
-
-      case username_r {
-        Ok(username) -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) { UserRegister(username, r) })
-
-          case result {
-            True ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("message", json.string("User registered successfully")),
-                  ]),
-                ),
-                201,
-              )
-            False ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([#("error", json.string("User exists"))]),
-                ),
-                409,
-              )
-          }
-        }
-        Error(_) -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // POST /subreddits
-    // Creates a new subreddit.
-    // Headers: Authorization: Username <username>
-    // Body: "title", "description"
-    ["subreddits"] -> {
-      use <- wisp.require_method(req, Post)
-      use username <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-
-      case get_form_params(formdata, ["title", "description"]) {
-        Ok([title, description]) -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) {
-              CreateSubreddit(username, title, description, r)
-            })
-
-          case result {
-            Ok(msg) ->
-              wisp.json_response(
-                json.to_string(
-                  json.object([
-                    #("message", json.string(msg)),
-                  ]),
-                ),
-                201,
-              )
-            Error(err) ->
-              wisp.json_response(
-                json.to_string(json.object([#("error", json.string(err))])),
-                400,
-              )
-          }
-        }
-        _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // GET /users/{username}/feed
-    // Gets a user's feed.
-    ["users", username, "feed"] -> {
-      use <- wisp.require_method(req, Get)
-      use auth_user <- require_auth(req)
-
-      // Validate that the authenticated user is requesting their own feed
-      case auth_user == username {
-        True -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) { GetFeed(username, r) })
-
-          case result {
-            Ok(posts) -> {
-              let posts_to_json = fn(posts: List(#(SubredditId, Post))) -> String {
-                json.object([
-                  #(
-                    "posts",
-                    json.array(
-                      list.map(posts, fn(post) {
-                        [
-                          #("subreddit_id", json.string(post.0)),
-                          #("title", json.string({ post.1 }.title)),
-                          #("content", json.string({ post.1 }.content)),
-                          #("author", json.string({ post.1 }.author)),
-                          #("upvote", json.int({ post.1 }.upvote)),
-                          #("downvote", json.int({ post.1 }.downvote)),
-                          #(
-                            "comments",
-                            json.array(
-                              dict.values({ post.1 }.comments),
-                              fn(comment) {
-                                json.object([
-                                  #("content", json.string(comment.content)),
-                                  #("author", json.string(comment.author)),
-                                  #("upvote", json.int(comment.upvote)),
-                                  #("downvote", json.int(comment.downvote)),
-                                  #(
-                                    "timestamp",
-                                    json.float(
-                                      comment.timestamp
-                                      |> timestamp.to_unix_seconds,
-                                    ),
-                                  ),
-                                ])
-                              },
-                            ),
-                          ),
-                          #("upvote", json.int({ post.1 }.upvote)),
-                          #("downvote", json.int({ post.1 }.downvote)),
-                          #(
-                            "timestamp",
-                            json.float(
-                              { post.1 }.timestamp |> timestamp.to_unix_seconds,
-                            ),
-                          ),
-                        ]
-                      }),
-                      of: json.object,
-                    ),
-                  ),
-                ])
-                |> json.to_string
-              }
-
-              wisp.json_response(posts_to_json(posts), 200)
-            }
-
-            Error(msg) ->
-              wisp.json_response(
-                json.to_string(json.object([#("error", json.string(msg))])),
-                404,
-              )
-          }
-        }
-        False -> wisp.response(403)
-      }
-    }
-
-    // PUT/DELETE /users/{username}/subscriptions/{subreddit_id}
-    // Joins or leaves a subreddit.
-    ["users", username, "subscriptions", subreddit_id] -> {
-      use auth_user <- require_auth(req)
-      case auth_user == username {
-        True -> {
-          case req.method {
-            Put -> {
-              let result =
-                process.call(engine_inbox, 1000, fn(r) {
-                  JoinSubreddit(username, subreddit_id, r)
-                })
-              case result {
-                Ok(msg) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("message", json.string(msg)),
-                      ]),
-                    ),
-                    200,
-                  )
-                Error(err) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("error", json.string(err)),
-                      ]),
-                    ),
-                    400,
-                  )
-              }
-            }
-            Delete -> {
-              let result =
-                process.call(engine_inbox, 1000, fn(r) {
-                  LeaveSubreddit(username, subreddit_id, r)
-                })
-              case result {
-                Ok(msg) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("message", json.string(msg)),
-                      ]),
-                    ),
-                    200,
-                  )
-                Error(err) ->
-                  wisp.json_response(
-                    json.to_string(
-                      json.object([
-                        #("error", json.string(err)),
-                      ]),
-                    ),
-                    400,
-                  )
-              }
-            }
-            _ -> wisp.method_not_allowed([Put, Delete])
-          }
-        }
-        False -> wisp.response(403)
-      }
-    }
-
-    // POST /subreddits/{subreddit_id}/posts/{post_id}/comments
-    // Comments on a post.
-    // Body: "content"
-    ["subreddits", subreddit_id, "posts", post_id_str, "comments"] -> {
-      use <- wisp.require_method(req, Post)
-      use username <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["content"]) {
-        Ok([content]) -> {
-          case uri.percent_decode(post_id_str) {
-            Ok(post_id_str) -> {
-              case bit_array.base64_decode(post_id_str) {
-                Ok(b) -> {
-                  let post_id_b = models.Uuid(value: b)
-                  let result =
-                    process.call(engine_inbox, 1000, fn(r) {
-                      CommentOnPost(
-                        username,
-                        subreddit_id,
-                        post_id_b,
-                        content,
-                        r,
-                      )
-                    })
-                  case result {
-                    Ok(id) -> {
-                      let models.Uuid(value: id_bits) = id
-                      let id_str = bit_array.base64_encode(id_bits, True)
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([#("comment_id", json.string(id_str))]),
-                        ),
-                        201,
-                      )
-                    }
-                    Error(err) ->
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([
-                            #("error", json.string(err)),
-                          ]),
-                        ),
-                        400,
-                      )
-                  }
-                }
-                Error(_) -> wisp.bad_request("Invalid post_id")
-              }
-            }
-
-            Error(_) -> wisp.bad_request("Invalid post_id")
-          }
-        }
-        _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // POST /comments/{parent_comment_id}/replies
-    // Replies to a comment.
-    // Body: "subreddit", "post_id", "content"
-    ["comments", parent_comment_id_str, "replies"] -> {
-      use <- wisp.require_method(req, Post)
-      use username <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-
-      case
-        get_form_params(formdata, [
-          "subreddit",
-          "post_id",
-          "content",
-        ])
-      {
-        Ok([subreddit, post_id_str, content]) -> {
-          case uri.percent_decode(parent_comment_id_str) {
-            Ok(parent_comment_id_str) -> {
-              case
-                bit_array.base64_decode(post_id_str),
-                bit_array.base64_decode(parent_comment_id_str)
-              {
-                Ok(a), Ok(b) -> {
-                  let post_id_b = models.Uuid(value: a)
-                  let parent_comment_id_b = models.Uuid(value: b)
-
-                  let result =
-                    process.call(engine_inbox, 1000, fn(r) {
-                      CommentOnComment(
-                        username,
-                        subreddit,
-                        post_id_b,
-                        parent_comment_id_b,
-                        content,
-                        r,
-                      )
-                    })
-                  case result {
-                    Ok(id) -> {
-                      let models.Uuid(value: id_bits) = id
-                      let id_str = bit_array.base64_encode(id_bits, True)
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([#("comment_id", json.string(id_str))]),
-                        ),
-                        201,
-                      )
-                    }
-                    Error(err) ->
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([
-                            #("error", json.string(err)),
-                          ]),
-                        ),
-                        400,
-                      )
-                  }
-                }
-
-                Ok(_), Error(_) -> wisp.bad_request("Invalid parent_comment_id")
-
-                Error(_), Ok(_) -> wisp.bad_request("Invalid post_id")
-
-                Error(_), Error(_) ->
-                  wisp.bad_request("Invalid parent_comment_id and post_id")
-              }
-            }
-
-            Error(_) -> wisp.bad_request("Invalid parent_comment_id")
-          }
-        }
-        _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // POST /posts/{post_id}/votes
-    // Votes on a post.
-    // Body: "subreddit", "vote" ("upvote" or "downvote")
-    ["posts", post_id_str, "votes"] -> {
-      use <- wisp.require_method(req, Post)
-      use username <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-      let subreddit_r = list.key_find(formdata.values, "subreddit")
-      let vote_r = list.key_find(formdata.values, "vote")
-      case subreddit_r, vote_r {
-        Ok(subreddit), Ok(vote) -> {
-          let vote_type = case vote {
-            "upvote" -> Upvote
-            "downvote" -> Downvote
-            _ -> Upvote
-          }
-          case uri.percent_decode(post_id_str) {
-            Ok(post_id_str) -> {
-              case bit_array.base64_decode(post_id_str) {
-                Ok(d) -> {
-                  let post_id_b = models.Uuid(value: d)
-                  let result =
-                    process.call(engine_inbox, 1000, fn(r) {
-                      VotePost(subreddit, username, post_id_b, vote_type, r)
-                    })
-                  case result {
-                    Ok(msg) ->
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([
-                            #("message", json.string(msg)),
-                          ]),
-                        ),
-                        200,
-                      )
-                    Error(err) ->
-                      wisp.json_response(
-                        json.to_string(
-                          json.object([#("error", json.string(err))]),
-                        ),
-                        400,
-                      )
-                  }
-                }
-                Error(_) -> wisp.bad_request("Invalid post id")
-              }
-            }
-
-            Error(_) -> wisp.bad_request("Invalid post id")
-          }
-        }
-        _, _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // POST /dms
-    // Sends a direct message.
-    // Body: "to", "content"
-    ["dms"] -> {
-      use <- wisp.require_method(req, Post)
-      use from <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["to", "content"]) {
-        Ok([to, content]) -> {
-          let result =
-            process.call(engine_inbox, 1000, fn(r) {
-              SendDirectMessage(from, to, content, r)
-            })
-          case result {
-            Ok(msg) -> wisp.ok() |> wisp.html_body(msg)
-            Error(err) -> wisp.response(400) |> wisp.html_body(err)
-          }
-        }
-        _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // POST /subreddits/{subreddit_id}/posts
-    // Creates a new post.
-    // Body: "title", "content"
-    ["subreddits", subreddit_id, "posts"] -> {
-      use <- wisp.require_method(req, Post)
-      use username <- require_auth(req)
-      use formdata <- wisp.require_form(req)
-      case get_form_params(formdata, ["title", "content"]) {
-        Ok([title, content]) -> {
-          let post_id =
-            process.call(engine_inbox, 1000, fn(r) {
-              CreatePostWithReply(
-                username: username,
-                subreddit_id: subreddit_id,
-                title: title,
-                content: content,
-                reply_to: r,
-              )
-            })
-          case post_id {
-            Ok(id) -> {
-              let models.Uuid(value: post_id_bits) = id
-              let post_id_string = bit_array.base64_encode(post_id_bits, True)
-              wisp.json_response(
-                json.to_string(
-                  json.object([#("post_id", json.string(post_id_string))]),
-                ),
-                201,
-              )
-            }
-            Error(err) ->
-              wisp.json_response(
-                json.to_string(json.object([#("error", json.string(err))])),
-                400,
-              )
-          }
-        }
-        _ -> wisp.bad_request("Form parameters are invalid")
-      }
-    }
-
-    // GET /users/{username}/dms
-    // Gets a user's direct messages.
-    ["users", username, "dms"] -> {
-      use <- wisp.require_method(req, Get)
-      use auth_user <- require_auth(req)
-
-      case auth_user == username {
-        True -> {
-          let dms_result =
-            process.call(engine_inbox, 1000, fn(r) {
-              GetDirectMessages(username, r)
-            })
-
-          case dms_result {
-            Ok(dms) -> {
-              let dms_to_json = fn(dms: List(DirectMessage)) -> String {
-                json.object([
-                  #(
-                    "dms",
-                    json.array(
-                      list.map(dms, fn(dm) {
-                        [
-                          #("from", json.string(dm.from)),
-                          #("to", json.string(dm.to)),
-                          #("content", json.string(dm.content)),
-                          #(
-                            "timestamp",
-                            json.float(
-                              dm.timestamp |> timestamp.to_unix_seconds,
-                            ),
-                          ),
-                        ]
-                      }),
-                      of: json.object,
-                    ),
-                  ),
-                ])
-                |> json.to_string
-              }
-              wisp.json_response(dms_to_json(dms), 200)
-            }
-            Error(err) ->
-              wisp.json_response(
-                json.to_string(json.object([#("error", json.string(err))])),
-                400,
-              )
-          }
-        }
-        False -> wisp.response(403)
-      }
-    }
-
-    // GET /users/{username}/karma
-    // Gets a user's karma.
-    ["users", username, "karma"] -> {
-      use <- wisp.require_method(req, Get)
-      use sender_username <- require_auth(req)
-
-      let karma_result =
-        process.call(engine_inbox, 1000, fn(r) {
-          GetKarma(sender_username, username, r)
-        })
-
-      case karma_result {
-        Ok(karma) ->
-          wisp.json_response(
-            json.to_string(json.object([#("karma", json.int(karma))])),
-            200,
-          )
-        Error(err) ->
-          wisp.json_response(
-            json.to_string(json.object([#("error", json.string(err))])),
-            400,
-          )
-      }
-    }
-
-    // GET /search/usernames?q={query}
-    // Searches for users containing query string.
-    ["search", "usernames"] -> {
-      use <- wisp.require_method(req, Get)
-      case list.key_find(wisp.get_query(req), "q") {
-        Ok(query) -> {
-          let users =
-            process.call(engine_inbox, 1000, fn(r) { SearchUsers(query, r) })
-
-          wisp.json_response(
-            json.to_string(json.array(users, of: json.string)),
-            200,
-          )
-        }
-
-        Error(_) -> wisp.bad_request("Missing query parameter")
-      }
-    }
-
-    // GET /search/subreddits?q={query}
-    // Searches for subreddits containing query string.
-    ["search", "subreddits"] -> {
-      use <- wisp.require_method(req, Get)
-      case list.key_find(wisp.get_query(req), "q") {
-        Ok(query) -> {
-          let subreddits =
-            process.call(engine_inbox, 1000, fn(r) {
-              SearchSubreddits(query, r)
-            })
-          wisp.json_response(
-            json.array(subreddits, of: fn(tup: #(SubredditId, String)) {
-              json.object([
-                #("name", json.string(tup.0)),
-                #("description", json.string(tup.1)),
-              ])
-            })
-              |> json.to_string,
-            200,
-          )
-        }
-
-        Error(_) -> wisp.bad_request("Missing query parameter")
-      }
-    }
-
-    // GET /subreddits/{subreddit_id}/members
-    // Gets the member count of a subreddit.
-    ["subreddits", subreddit_id, "members"] -> {
-      use <- wisp.require_method(req, Get)
-      let count =
-        process.call(engine_inbox, 1000, fn(r) {
-          GetSubredditMemberCount(subreddit_id, r)
-        })
-
-      wisp.json_response(
-        json.to_string(json.object([#("member_count", json.int(count))])),
-        200,
-      )
-    }
-
-    // GET /metrics
-    // Gets the engine's performance metrics.
-    ["metrics"] -> {
-      use <- wisp.require_method(req, Get)
-      let metrics =
-        process.call(engine_inbox, 1000, fn(r) { GetEngineMetrics(r) })
-
-      let metrics_to_json = fn(m: PerformanceMetrics) -> String {
-        json.object([
-          #("total_users", json.int(m.total_users)),
-          #("total_posts", json.int(m.total_posts)),
-          #("total_comments", json.int(m.total_comments)),
-          #("total_votes", json.int(m.total_votes)),
-          #("total_messages", json.int(m.total_messages)),
-          #(
-            "simulation_start_time",
-            json.float(m.simulation_start_time |> timestamp.to_unix_seconds),
-          ),
-          #(
-            "simulation_checkpoint_time",
-            json.float(
-              m.simulation_checkpoint_time |> timestamp.to_unix_seconds,
-            ),
-          ),
-          #("posts_per_second", json.float(m.posts_per_second)),
-          #("messages_per_second", json.float(m.messages_per_second)),
-        ])
-        |> json.to_string
-      }
-      wisp.json_response(metrics_to_json(metrics), 200)
-    }
-
-    _ -> wisp.not_found()
-  }
-}
-
-pub type EngineState {
-  EngineState(
-    self_subject: process.Subject(EngineMessage),
-    users: Dict(Username, User),
-    subreddits: Dict(SubredditId, Subreddit),
-    metrics: PerformanceMetrics,
-  )
-}
-
-pub type EngineMessage {
-  UserRegister(username: Username, reply_to: process.Subject(Bool))
-  CreateSubreddit(
-    username: Username,
-    name: SubredditId,
-    description: String,
-    reply_to: process.Subject(Result(String, String)),
-  )
-  JoinSubreddit(
-    username: Username,
-    subreddit_name: SubredditId,
-    reply_to: process.Subject(Result(String, String)),
-  )
-  LeaveSubreddit(
-    username: Username,
-    subreddit_name: SubredditId,
-    reply_to: process.Subject(Result(String, String)),
-  )
-  CreatePostWithReply(
-    username: Username,
-    subreddit_id: SubredditId,
-    content: String,
-    title: String,
-    reply_to: process.Subject(Result(PostId, String)),
-  )
-  CommentOnPost(
-    username: Username,
-    subreddit_id: SubredditId,
-    post_id: PostId,
-    content: String,
-    reply_to: process.Subject(Result(CommentId, String)),
-  )
-  CommentOnComment(
-    username: Username,
-    subreddit_id: SubredditId,
-    post_id: PostId,
-    parent_comment_id: CommentId,
-    content: String,
-    reply_to: process.Subject(Result(CommentId, String)),
-  )
-  VotePost(
-    subreddit_id: SubredditId,
-    username: Username,
-    post_id: PostId,
-    vote: VoteType,
-    reply_to: process.Subject(Result(String, String)),
-  )
-  GetFeed(
-    username: Username,
-    reply_to: process.Subject(Result(List(#(SubredditId, Post)), String)),
-  )
-  GetDirectMessages(
-    username: Username,
-    reply_to: process.Subject(Result(List(DirectMessage), String)),
-  )
-  SendDirectMessage(
-    from_username: Username,
-    to_username: Username,
-    content: String,
-    reply_to: process.Subject(Result(String, String)),
-  )
-  GetKarma(
-    sender_username: Username,
-    username: Username,
-    reply_to: process.Subject(Result(Int, String)),
-  )
-  GetSubredditMemberCount(
-    subreddit_id: SubredditId,
-    reply_to: process.Subject(Int),
-  )
-  GetEngineMetrics(reply_to: process.Subject(PerformanceMetrics))
-  RefreshEngineMetrics
-  SearchUsers(query: String, reply_to: process.Subject(List(Username)))
-  SearchSubreddits(
-    query: String,
-    reply_to: process.Subject(List(#(SubredditId, String))),
-  )
-}
-
-pub fn engine_message_handler(
-  state: EngineState,
-  message: EngineMessage,
-) -> actor.Next(EngineState, EngineMessage) {
-  // Route incoming messages to appropriate handler functions
-  case message {
-    UserRegister(username:, reply_to:) ->
-      actor.continue(register_user(state, username, reply_to))
-    CreateSubreddit(username:, name:, description:, reply_to:) ->
-      actor.continue(create_subreddit(
-        state,
-        username,
-        name,
-        description,
-        reply_to,
-      ))
-    JoinSubreddit(username:, subreddit_name:, reply_to:) ->
-      actor.continue(join_subreddit(state, username, subreddit_name, reply_to))
-    LeaveSubreddit(username:, subreddit_name:, reply_to:) ->
-      actor.continue(leave_subreddit(state, username, subreddit_name, reply_to))
-    CommentOnPost(username:, subreddit_id:, post_id:, content:, reply_to:) ->
-      actor.continue(comment_on_post(
-        state,
-        username,
-        subreddit_id,
-        post_id,
-        content,
-        reply_to,
-      ))
-    CommentOnComment(
-      username: username,
-      subreddit_id: subreddit_id,
-      post_id: post_id,
-      parent_comment_id: parent_comment_id,
-      content: content,
-      reply_to: reply_to,
-    ) ->
-      actor.continue(comment_on_comment(
-        state,
-        username,
-        subreddit_id,
-        post_id,
-        parent_comment_id,
-        content,
-        reply_to,
-      ))
-    GetFeed(username:, reply_to:) ->
-      actor.continue(get_feed(state, username, reply_to))
-    GetDirectMessages(username:, reply_to:) ->
-      actor.continue(get_direct_messages(state, username, reply_to))
-    SendDirectMessage(
-      from_username: from_username,
-      to_username: to_username,
-      content: content,
-      reply_to: reply_to,
-    ) ->
-      actor.continue(send_direct_message(
-        state,
-        from_username,
-        to_username,
-        content,
-        reply_to,
-      ))
-    CreatePostWithReply(username:, subreddit_id:, content:, title:, reply_to:) ->
-      actor.continue(create_post_with_reply(
-        state,
-        username,
-        subreddit_id,
-        content,
-        title,
-        reply_to,
-      ))
-    VotePost(subreddit_id:, username:, post_id:, vote:, reply_to:) ->
-      actor.continue(vote_post(
-        state,
-        username,
-        subreddit_id,
-        post_id,
-        vote,
-        reply_to,
-      ))
-    GetKarma(sender_username:, username:, reply_to:) ->
-      actor.continue(get_karma(state, sender_username, username, reply_to))
-    GetSubredditMemberCount(subreddit_id:, reply_to:) ->
-      actor.continue(get_subreddit_member_count(state, subreddit_id, reply_to))
-    GetEngineMetrics(reply_to:) ->
-      actor.continue(get_engine_metrics(state, reply_to))
-    RefreshEngineMetrics -> actor.continue(refresh_engine_metrics(state))
-    SearchSubreddits(query:, reply_to:) ->
-      actor.continue(search_subreddits(state, query, reply_to))
-    SearchUsers(query:, reply_to:) ->
-      actor.continue(search_users(state, query, reply_to))
-  }
+  state
 }
 
 pub fn search_subreddits(
-  state: EngineState,
+  state: models.EngineState,
   query: String,
   reply_to: process.Subject(List(#(SubredditId, String))),
-) -> EngineState {
+) -> models.EngineState {
   printi("Searching subreddits for query: " <> query)
   // Perform search and retrieve matching subreddits
   let results =
@@ -956,10 +58,10 @@ pub fn search_subreddits(
 }
 
 pub fn search_users(
-  state: EngineState,
+  state: models.EngineState,
   query: String,
   reply_to: process.Subject(List(Username)),
-) -> EngineState {
+) -> models.EngineState {
   printi("Searching users for query: " <> query)
   // Perform search and retrieve matching users
   let results =
@@ -972,7 +74,7 @@ pub fn search_users(
   state
 }
 
-pub fn refresh_engine_metrics(state: EngineState) -> EngineState {
+pub fn refresh_engine_metrics(state: models.EngineState) -> models.EngineState {
   let simulation_checkpoint_time = timestamp.system_time()
   // Update metrics timestamps
   let updated_metrics =
@@ -993,23 +95,23 @@ pub fn refresh_engine_metrics(state: EngineState) -> EngineState {
         |> float.to_precision(3),
     )
   process.send_after(state.self_subject, 2000, RefreshEngineMetrics)
-  EngineState(..state, metrics: updated_metrics)
+  models.EngineState(..state, metrics: updated_metrics)
 }
 
 pub fn get_engine_metrics(
-  state: EngineState,
+  state: models.EngineState,
   reply_to: process.Subject(PerformanceMetrics),
-) -> EngineState {
+) -> models.EngineState {
   printi("Requesting engine performance metrics")
   process.send(reply_to, state.metrics)
   state
 }
 
 pub fn get_subreddit_member_count(
-  state: EngineState,
+  state: models.EngineState,
   subreddit_id: SubredditId,
   reply_to: process.Subject(Int),
-) -> EngineState {
+) -> models.EngineState {
   printi("Requesting member count for r/" <> subreddit_id)
   // Retrieve subreddit and count subscribers
   let member_count = case dict.get(state.subreddits, subreddit_id) {
@@ -1021,11 +123,11 @@ pub fn get_subreddit_member_count(
 }
 
 pub fn get_karma(
-  state: EngineState,
+  state: models.EngineState,
   sender_username: Username,
   username: Username,
   reply_to: process.Subject(Result(Int, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(sender_username <> " is requesting karma for " <> username)
 
   case dict.has_key(state.users, sender_username) {
@@ -1055,13 +157,13 @@ pub fn get_karma(
 }
 
 pub fn vote_post(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_id: SubredditId,
   post_id: PostId,
   vote: VoteType,
   reply_to: process.Subject(Result(String, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is voting in r/" <> subreddit_id)
 
   case dict.has_key(state.users, username) {
@@ -1136,6 +238,7 @@ pub fn vote_post(
                           models.User(
                             username: found_post.author,
                             upvotes: 0,
+                            public_key: None,
                             downvotes: 0,
                             subscribed_subreddits: set.new(),
                             inbox: [],
@@ -1150,7 +253,7 @@ pub fn vote_post(
                 }
               }
               process.send(reply_to, Ok("Voted successfully"))
-              EngineState(
+              models.EngineState(
                 ..state,
                 subreddits: updated_subreddits,
                 users: updated_users,
@@ -1173,13 +276,14 @@ pub fn vote_post(
 }
 
 pub fn create_post_with_reply(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_id: SubredditId,
+  signature: Option(String),
   content: String,
   title: String,
   reply_to: process.Subject(Result(PostId, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is creating post in r/" <> subreddit_id)
 
   case dict.has_key(state.users, username) {
@@ -1199,6 +303,7 @@ pub fn create_post_with_reply(
           upvote: 0,
           downvote: 0,
           timestamp: timestamp.system_time(),
+          signature: signature,
         )
 
       // Send the post_id back to the requester
@@ -1229,7 +334,7 @@ pub fn create_post_with_reply(
           }
         })
 
-      EngineState(
+      models.EngineState(
         ..state,
         subreddits: updated_subreddits,
         metrics: models.PerformanceMetrics(
@@ -1247,12 +352,12 @@ pub fn create_post_with_reply(
 }
 
 pub fn send_direct_message(
-  state: EngineState,
+  state: models.EngineState,
   from_username: Username,
   to_username: Username,
   content: String,
   reply_to: process.Subject(Result(String, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(from_username <> " is sending DM to " <> to_username)
 
   case dict.has_key(state.users, from_username) {
@@ -1290,7 +395,7 @@ pub fn send_direct_message(
         False -> process.send(reply_to, Error("Recipient not found"))
       }
 
-      EngineState(
+      models.EngineState(
         ..state,
         users: updated_users,
         metrics: models.PerformanceMetrics(
@@ -1308,10 +413,10 @@ pub fn send_direct_message(
 }
 
 pub fn get_direct_messages(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   reply_to: process.Subject(Result(List(DirectMessage), String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is fetching their direct messages")
 
   // Retrieve user's inbox
@@ -1329,10 +434,10 @@ pub fn get_direct_messages(
 }
 
 pub fn get_feed(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   reply_to: process.Subject(Result(List(#(SubredditId, Post)), String)),
-) -> EngineState {
+) -> models.EngineState {
   // Get user's subscribed subreddits
   let result = case dict.get(state.users, username) {
     Ok(user) -> {
@@ -1372,14 +477,14 @@ pub fn get_feed(
 }
 
 pub fn comment_on_comment(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_id: SubredditId,
   post_id: PostId,
   parent_comment_id: CommentId,
   content: String,
   reply_to: process.Subject(Result(CommentId, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is replying to a comment in r/" <> subreddit_id)
 
   case dict.has_key(state.users, username) {
@@ -1454,7 +559,7 @@ pub fn comment_on_comment(
         False -> process.send(reply_to, Error("Failed to comment on comment"))
       }
 
-      EngineState(
+      models.EngineState(
         ..state,
         subreddits: updated_subreddits,
         metrics: models.PerformanceMetrics(
@@ -1472,13 +577,13 @@ pub fn comment_on_comment(
 }
 
 pub fn comment_on_post(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_id: SubredditId,
   post_id: PostId,
   content: String,
   reply_to: process.Subject(Result(CommentId, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is commenting on a post in r/" <> subreddit_id)
 
   case dict.has_key(state.users, username) {
@@ -1545,7 +650,7 @@ pub fn comment_on_post(
         False -> process.send(reply_to, Error("Failed to comment on post"))
       }
 
-      EngineState(
+      models.EngineState(
         ..state,
         subreddits: updated_subreddits,
         metrics: models.PerformanceMetrics(
@@ -1563,11 +668,11 @@ pub fn comment_on_post(
 }
 
 pub fn leave_subreddit(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_name: SubredditId,
   reply_to: process.Subject(Result(String, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is leaving subreddit " <> subreddit_name)
 
   case dict.has_key(state.users, username) {
@@ -1593,15 +698,14 @@ pub fn leave_subreddit(
                 "⚠ User " <> username <> " not found for leaving subreddit",
               )
               user_op
-              |> option.unwrap(
-                models.User(
-                  username: username,
-                  upvotes: 0,
-                  downvotes: 0,
-                  subscribed_subreddits: set.new(),
-                  inbox: [],
-                ),
-              )
+              |> option.unwrap(models.User(
+                username: username,
+                upvotes: 0,
+                downvotes: 0,
+                subscribed_subreddits: set.new(),
+                inbox: [],
+                public_key: None,
+              ))
             }
           }
         })
@@ -1639,17 +743,21 @@ pub fn leave_subreddit(
         False -> process.send(reply_to, Error("Failed to leave subreddit"))
       }
 
-      EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+      models.EngineState(
+        ..state,
+        users: updated_users,
+        subreddits: updated_subreddits,
+      )
     }
   }
 }
 
 pub fn join_subreddit(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   subreddit_name: SubredditId,
   reply_to: process.Subject(Result(String, String)),
-) -> EngineState {
+) -> models.EngineState {
   printi(username <> " is joining r/" <> subreddit_name)
 
   case dict.has_key(state.users, username) {
@@ -1676,15 +784,14 @@ pub fn join_subreddit(
                 "⚠ User " <> username <> " not found for joining subreddit",
               )
               user_op
-              |> option.unwrap(
-                models.User(
-                  username: username,
-                  upvotes: 0,
-                  downvotes: 0,
-                  subscribed_subreddits: set.from_list([subreddit_name]),
-                  inbox: [],
-                ),
-              )
+              |> option.unwrap(models.User(
+                username: username,
+                upvotes: 0,
+                downvotes: 0,
+                subscribed_subreddits: set.from_list([subreddit_name]),
+                inbox: [],
+                public_key: None,
+              ))
             }
           }
         })
@@ -1721,18 +828,22 @@ pub fn join_subreddit(
         True -> process.send(reply_to, Ok("Joined subreddit successfully"))
         False -> process.send(reply_to, Error("Failed to join subreddit"))
       }
-      EngineState(..state, users: updated_users, subreddits: updated_subreddits)
+      models.EngineState(
+        ..state,
+        users: updated_users,
+        subreddits: updated_subreddits,
+      )
     }
   }
 }
 
 pub fn create_subreddit(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
   name: SubredditId,
   description: String,
   reply_to: process.Subject(Result(String, String)),
-) -> EngineState {
+) -> models.EngineState {
   case dict.has_key(state.users, username) {
     False -> {
       process.send(reply_to, Error("Invalid user"))
@@ -1763,16 +874,17 @@ pub fn create_subreddit(
         }
       }
 
-      EngineState(..state, subreddits: updated_subreddits)
+      models.EngineState(..state, subreddits: updated_subreddits)
     }
   }
 }
 
 pub fn register_user(
-  state: EngineState,
+  state: models.EngineState,
   username: Username,
+  public_key: Option(models.PublicKeyRsa2048),
   reply_to: process.Subject(Bool),
-) -> EngineState {
+) -> models.EngineState {
   // Create new user with default values
   let new_user =
     models.User(
@@ -1781,6 +893,7 @@ pub fn register_user(
       downvotes: 0,
       subscribed_subreddits: set.new(),
       inbox: [],
+      public_key: public_key,
     )
 
   // Check if user already exists to avoid duplicate registrations
@@ -1797,7 +910,7 @@ pub fn register_user(
     }
   }
 
-  EngineState(
+  models.EngineState(
     ..state,
     users: updated_users,
     metrics: models.PerformanceMetrics(
@@ -1818,4 +931,170 @@ fn printi(str: String) -> Nil {
     False -> Nil
   }
   Nil
+}
+
+pub fn main() -> Nil {
+  wisp.configure_logger()
+
+  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+  printi("       Reddit Engine Starting Up")
+  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+  // Initialize and start the actor with named subject
+  let assert Ok(engine_actor) =
+    actor.new_with_initialiser(1000, fn(self_sub) {
+      models.EngineState(
+        self_subject: self_sub,
+        users: dict.new(),
+        subreddits: dict.new(),
+        metrics: models.PerformanceMetrics(
+          total_users: 0,
+          total_posts: 0,
+          total_comments: 0,
+          total_votes: 0,
+          total_messages: 0,
+          simulation_start_time: timestamp.system_time(),
+          simulation_checkpoint_time: timestamp.system_time(),
+          posts_per_second: 0.0,
+          messages_per_second: 0.0,
+        ),
+      )
+      |> actor.initialised
+      |> actor.returning(self_sub)
+      |> Ok
+    })
+    |> actor.on_message(engine_message_handler)
+    |> actor.start
+
+  process.send(engine_actor.data, RefreshEngineMetrics)
+  printi("✓ Reddit engine actor started")
+
+  // Start web server
+  let assert Ok(_) =
+    wisp_mist.handler(
+      fn(req) { router.handle_request(req, engine_actor.data) },
+      wisp.random_string(64),
+    )
+    |> mist.new
+    |> mist.bind("0.0.0.0")
+    |> mist.port(8080)
+    |> mist.start
+
+  printi("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+  printi("  Engine ready - waiting for messages")
+  printi("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+  process.sleep_forever()
+  Nil
+}
+
+pub fn engine_message_handler(
+  state: models.EngineState,
+  message: EngineMessage,
+) -> actor.Next(models.EngineState, EngineMessage) {
+  // Route incoming messages to appropriate handler functions
+  case message {
+    models.UserRegister(username:, reply_to:, public_key:) ->
+      actor.continue(register_user(state, username, public_key, reply_to))
+    models.CreateSubreddit(username:, name:, description:, reply_to:) ->
+      actor.continue(create_subreddit(
+        state,
+        username,
+        name,
+        description,
+        reply_to,
+      ))
+    models.JoinSubreddit(username:, subreddit_name:, reply_to:) ->
+      actor.continue(join_subreddit(state, username, subreddit_name, reply_to))
+    models.LeaveSubreddit(username:, subreddit_name:, reply_to:) ->
+      actor.continue(leave_subreddit(state, username, subreddit_name, reply_to))
+    models.CommentOnPost(
+      username:,
+      subreddit_id:,
+      post_id:,
+      content:,
+      reply_to:,
+    ) ->
+      actor.continue(comment_on_post(
+        state,
+        username,
+        subreddit_id,
+        post_id,
+        content,
+        reply_to,
+      ))
+    models.CommentOnComment(
+      username: username,
+      subreddit_id: subreddit_id,
+      post_id: post_id,
+      parent_comment_id: parent_comment_id,
+      content: content,
+      reply_to: reply_to,
+    ) ->
+      actor.continue(comment_on_comment(
+        state,
+        username,
+        subreddit_id,
+        post_id,
+        parent_comment_id,
+        content,
+        reply_to,
+      ))
+    models.GetFeed(username:, reply_to:) ->
+      actor.continue(get_feed(state, username, reply_to))
+    models.GetDirectMessages(username:, reply_to:) ->
+      actor.continue(get_direct_messages(state, username, reply_to))
+    models.SendDirectMessage(
+      from_username: from_username,
+      to_username: to_username,
+      content: content,
+      reply_to: reply_to,
+    ) ->
+      actor.continue(send_direct_message(
+        state,
+        from_username,
+        to_username,
+        content,
+        reply_to,
+      ))
+    models.CreatePostWithReply(
+      username:,
+      subreddit_id:,
+      signature:,
+      content:,
+      title:,
+      reply_to:,
+    ) ->
+      actor.continue(create_post_with_reply(
+        state,
+        username,
+        subreddit_id,
+        signature,
+        content,
+        title,
+        reply_to,
+      ))
+    models.VotePost(subreddit_id:, username:, post_id:, vote:, reply_to:) ->
+      actor.continue(vote_post(
+        state,
+        username,
+        subreddit_id,
+        post_id,
+        vote,
+        reply_to,
+      ))
+    models.GetKarma(sender_username:, username:, reply_to:) ->
+      actor.continue(get_karma(state, sender_username, username, reply_to))
+    models.GetSubredditMemberCount(subreddit_id:, reply_to:) ->
+      actor.continue(get_subreddit_member_count(state, subreddit_id, reply_to))
+    models.GetEngineMetrics(reply_to:) ->
+      actor.continue(get_engine_metrics(state, reply_to))
+    models.RefreshEngineMetrics -> actor.continue(refresh_engine_metrics(state))
+    models.SearchSubreddits(query:, reply_to:) ->
+      actor.continue(search_subreddits(state, query, reply_to))
+    models.SearchUsers(query:, reply_to:) ->
+      actor.continue(search_users(state, query, reply_to))
+    models.GetPublicKey(username:, reply_to:) ->
+      actor.continue(get_public_key(state, username, reply_to))
+  }
 }
