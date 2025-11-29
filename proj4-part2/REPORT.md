@@ -1,257 +1,211 @@
-# Project 4: Reddit Engine and Simulator using BEAM OTP
+# Reddit Engine - Project 4 Part 2 Report
 
-**Team Members:**
-*   Yash Rastogi
-*   Pavan Karthik Chilla
+## Group Members
+- Yash Rastogi
+- Pavan Karthik Chilla
 
-## 1. Problem Definition
+## Demo Videos
+- **Core Project Demo**: https://youtu.be/IiPps98lRVA
+- **Bonus Demo (Digital Signatures)**: https://youtu.be/WUGYkS89Ixs
 
-This project involves implementing a Reddit-like engine and a client tester/simulator. The engine provides core Reddit functionalities, while the simulator tests these functionalities by mimicking realistic user behavior, including distributed interactions and performance measurement. This project focuses on the backend engine and simulator, without a frontend API or web client.
+---
 
-## 2. Implementation Details
+## Implementation Summary
 
-The project is structured into two main components: the Reddit Engine and the Client Simulator, both implemented in Gleam and leveraging Erlang's BEAM for distributed processing.
+### REST API Design
 
-### 2.1 Reddit Engine (`src/reddit_engine.gleam`)
+The Reddit Engine exposes a REST API built with Gleam using the Wisp web framework. The server runs on port 8080 and handles all requests through a central actor that manages state.
 
-The `reddit_engine.gleam` module implements the core logic for a Reddit-like platform. It manages users, subreddits, posts, comments, votes, and direct messages. The engine runs as a single process, globally registered on an Erlang node, allowing multiple client simulators to connect to it.
+**Key Endpoints:**
 
-**Key Functionalities:**
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/users` | Register user (optionally with public key) |
+| POST | `/subreddits` | Create subreddit |
+| PUT | `/users/{user}/subscriptions/{sub}` | Join subreddit |
+| DELETE | `/users/{user}/subscriptions/{sub}` | Leave subreddit |
+| POST | `/subreddits/{sub}/posts` | Create post (with optional signature) |
+| POST | `/posts/{id}/votes` | Vote on post |
+| POST | `/subreddits/{sub}/posts/{id}/comments` | Comment on post |
+| POST | `/comments/{id}/replies` | Reply to comment |
+| POST | `/dms` | Send direct message |
+| GET | `/users/{user}/feed` | Get user's feed |
+| GET | `/users/{user}/dms` | Get direct messages |
+| GET | `/users/{user}/karma` | Get karma score |
+| GET | `/users/{user}/public_key` | Get user's public key |
+| GET | `/search/usernames?q=` | Search users |
+| GET | `/search/subreddits?q=` | Search subreddits |
+| GET | `/metrics` | Get engine metrics |
 
-*   **User Management:**
-    *   `UserRegister(username: Username)`: Registers a new user.
-    *   `GetKarma(sender_username: Username, username: Username, reply_to: process.Subject(Int))`: Calculates and returns a user's karma based on upvotes and downvotes.
-*   **Subreddit Management:**
-    *   `CreateSubreddit(name: SubredditId, description: String)`: Creates a new subreddit.
-    *   `JoinSubreddit(username: Username, subreddit_name: SubredditId)`: Adds a user to a subreddit's subscriber list.
-    *   `LeaveSubreddit(username: Username, subreddit_name: SubredditId)`: Removes a user from a subreddit's subscriber list.
-    *   `GetSubredditMemberCount(subreddit_id: SubredditId, reply_to: process.Subject(Int))`: Returns the number of subscribers for a given subreddit.
-*   **Post and Comment Management:**
-    *   `CreatePostWithReply(username: Username, subreddit_id: SubredditId, content: String, title: String, reply_to: process.Subject(PostId))`: Creates a new post in a specified subreddit and replies with the `PostId`.
-    *   `CommentOnPost(username: Username, subreddit_id: SubredditId, post_id: PostId, content: String)`: Adds a top-level comment to a post.
-    *   `CommentOnComment(username: Username, subreddit_id: SubredditId, post_id: PostId, parent_comment_id: CommentId, content: String)`: Adds a reply to an existing comment, supporting hierarchical comments.
-    *   `VotePost(subreddit_id: SubredditId, username: Username, post_id: PostId, vote: VoteType)`: Allows users to upvote or downvote a post, affecting the author's karma.
-*   **Messaging and Feed:**
-    *   `GetFeed(username: Username, reply_to: process.Subject(List(Post)))`: Retrieves a feed of posts from subreddits the user is subscribed to.
-    *   `SendDirectMessage(from_username: Username, to_username: Username, content: String)`: Sends a direct message from one user to another.
-    *   `GetDirectMessages(username: Username, reply_to: process.Subject(List(DirectMessage)))`: Retrieves all direct messages for a user.
-*   **Distributed Communication:**
-    *   Utilizes Erlang's `net_kernel_start`, `set_cookie`, `register_global`, `whereis_global`, and `send_to_named_subject` for inter-node communication.
+### Client Functionality
 
-### 2.2 Client Simulator (`src/client_simulator.gleam`)
+**1. Concurrent User Simulator (`client_simulator.gleam`)**
+- Simulates 1000+ concurrent users as independent actors
+- Users follow Zipf distribution for subreddit joins (popular subs get more members)
+- Simulates realistic behavior: register → join subreddits → post/comment/vote cycles
+- Reports performance metrics at completion
 
-The `client_simulator.gleam` module is responsible for simulating user interactions with the Reddit Engine. It spawns multiple independent user processes that perform various actions, mimicking real-world usage patterns.
+**2. REST API Demo (`demo_main.sh`)**
+- Interactive bash script demonstrating all API endpoints
+- Shows user registration, subreddit creation, posting, commenting, voting, DMs, and search
 
-**Key Features:**
+**3. Signed Posts Demo (`demo_signed_posts.sh`)**
+- Demonstrates the bonus public key signature feature
+- Generates RSA key pair, registers user with public key, creates signed post
 
-*   **User Simulation:**
-    *   `total_users`: Configurable constant for the number of simulated users.
-    *   Each user is spawned as a separate Erlang process (`process.spawn_unlinked`), allowing for concurrent simulation.
-*   **Realistic Behavior:**
-    *   **Online/Offline Cycles:** Users simulate periods of activity (`online_duration`) and inactivity (`offline_duration`) to model intermittent connectivity.
-    *   **Subreddit Joining:** Users join a varying number of subreddits, with "power users" joining more.
-    *   **Zipf Distribution for Subreddit Popularity:** The `calculate_zipf_distribution` and `pick_subreddit_zipf` functions ensure that subreddit popularity follows a Zipf-like distribution, meaning a few subreddits are very popular, and many are less so. Power users strictly follow this distribution, while regular users have a mix of Zipf and uniform random choices.
-    *   **Activity Types:** Users perform a mix of activities: creating posts (30%), commenting (20%), sending direct messages (20%), voting (20%), and getting their feed (10%).
-    *   **Reposts:** Power users have a chance to create reposts.
-*   **Distributed Client-Engine Interaction:**
-    *   The simulator connects to the `reddit_engine` node using distributed Erlang.
-    *   Messages are sent to the globally registered `reddit_engine` process.
-*   **Post Tracking:** A `post_tracker` actor is used to keep a global list of created posts, enabling users to comment and vote on existing posts.
+### Server Architecture
 
-## 3. Performance Metrics
+The engine uses the actor model (via Gleam OTP) with a single stateful actor handling:
+- User management (registration, karma tracking)
+- Subreddit management (creation, membership)
+- Content management (posts, comments, votes)
+- Direct messaging
+- Performance metrics
 
-The `reddit_engine` collects and reports several performance metrics to evaluate the system's throughput and responsiveness. These metrics are updated periodically and can be retrieved by the simulator.
+---
 
-**Collected Metrics (`PerformanceMetrics`):**
+## How to Run
 
-*   `total_users`: Total number of registered users.
-*   `total_posts`: Total number of posts created.
-*   `total_comments`: Total number of comments processed.
-*   `total_votes`: Total number of votes processed.
-*   `total_messages`: Total number of direct messages sent.
-*   `simulation_start_time`: Timestamp when the engine started.
-*   `simulation_checkpoint_time`: Last timestamp when metrics were refreshed.
-*   `posts_per_second`: Rate of posts created per second.
-*   `messages_per_second`: Rate of messages sent per second.
+### Prerequisites
+- Gleam 1.x installed
+- Erlang/OTP runtime
 
-The `client_simulator` calls `GetEngineMetrics` to retrieve and display these statistics at the end of the simulation.
+### Start the Server
+```bash
+cd reddit_engine
+gleam run
+```
+Server starts on `http://localhost:8080`
 
-### 3.1 Simulation Results (900,000 Users)
+> **Note:** The server keeps all state in memory. Restart the server (`Ctrl+C` then `gleam run`) between demo/simulator runs for a fresh state.
 
-The following metrics were obtained from a simulation with **900,000 concurrent users** distributed across 8 subreddits:
+### Run the Main Demo
+```bash
+./demo_main.sh
+```
+Walks through all API features with colored output.
 
-**Subreddit Membership Distribution (Zipf):**
+### Run the Simulator
+```bash
+gleam run -m client_simulator
+```
+Spawns 1000 (customizable) concurrent user actors.
 
-| Rank | Subreddit       | Members   | Actual % | Expected % (Zipf) |
-|------|-----------------|-----------|----------|-------------------|
-| 1    | r/gaming        | 553,086   | 25.8%    | 36.0%             |
-| 2    | r/technology    | 362,017   | 16.9%    | 18.0%             |
-| 3    | r/movies        | 279,608   | 13.0%    | 12.0%             |
-| 4    | r/gleam         | 234,222   | 10.9%    | 9.0%              |
-| 5    | r/science       | 204,681   | 9.5%     | 7.2%              |
-| 6    | r/functional    | 185,055   | 8.6%     | 6.0%              |
-| 7    | r/erlang        | 169,830   | 7.9%     | 5.1%              |
-| 8    | r/distributed   | 158,613   | 7.4%     | 4.5%              |
+### Run the Simulator in Docker (Network Demo)
+To demonstrate the client and server communicating over the network, a Dockerfile is included to run the simulator in a container while the server runs on the host:
+```bash
+# Start the server on host
+gleam run
 
-*Note: Users can join multiple subreddits, so total memberships (2,147,112) exceeds total users (900,000). Actual percentages are calculated from total memberships. The distribution shows good alignment with Zipf's law, with some variation due to the 30% uniform random selection by regular users.*
-
-**Engine Performance Metrics:**
-
-| Metric                      | Value         | Description                                    |
-|-----------------------------|---------------|------------------------------------------------|
-| Total Posts Created         | 2,590,019     | Posts created across all subreddits            |
-| Total Comments Processed    | 923           | Comments on posts (hierarchical supported)     |
-| Total Votes Processed       | 905           | Upvotes and downvotes on posts                 |
-| Total Messages Processed    | 655,566       | Total operations including DMs                 |
-| **Posts per Second**        | **10,334.378** | Average throughput for post creation          |
-| **Messages per Second**     | **2,615.76**   | Average throughput for message processing     |
-| **Simulation Duration**     | **250.62 sec** | Total time elapsed for the simulation         |
-
-**Simulation Characteristics:**
-
-*   **Duration:** 250.62 seconds (~4.2 minutes)
-*   **Scale:** 900,000 concurrent users
-*   **Total Operations:** 3,247,413 (posts + comments + votes + messages)
-*   **Activity Distribution:**
-    *   30% - Creating posts
-    *   20% - Commenting on posts
-    *   20% - Sending direct messages
-    *   20% - Voting on posts
-    *   10% - Retrieving feed
-
-**Key Observations:**
-
-1. **Massive Throughput:** The engine demonstrated exceptional performance under extreme load, achieving **~10,334 posts/second** and **~2,616 messages/second**. This showcases the BEAM's superior capability in handling massive concurrent operations.
-
-2. **Linear Scalability:** Scaling from 10,000 to 900,000 users (90x increase) resulted in proportional throughput increases, demonstrating near-linear scalability of the actor-based architecture.
-
-3. **Zipf Distribution at Scale:** The subreddit membership distribution perfectly follows Zipf's law with the top subreddit (r/gaming) having 3.5x more members than the second (r/technology), validating the simulation's realistic behavior at massive scale.
-
-4. **Resource Efficiency:** Over 2.5 million posts were created in just over 4 minutes, demonstrating the BEAM's efficient process scheduling and memory management even under extreme concurrent load.
-
-5. **Consistent Performance:** The system maintained stable throughput throughout the 250-second simulation, indicating no degradation under sustained high load.
-
-## 4. Architecture and Design Decisions
-
-### 4.1 Actor-Based Concurrency
-
-The system leverages Erlang's actor model through Gleam's OTP abstractions:
-
-*   **Single Engine Actor:** The Reddit engine runs as a single stateful actor that processes messages sequentially, ensuring data consistency without explicit locking.
-*   **Multiple User Actors:** Each simulated user is an independent actor (process), allowing 1000+ concurrent users to interact with the engine simultaneously.
-*   **Post Tracker Actor:** A dedicated actor maintains a global list of created posts, enabling users to vote and comment on existing content.
-
-### 4.2 Distributed Communication
-
-The implementation uses Erlang's distributed node capabilities:
-
-*   **Global Registration:** The engine registers itself globally as `reddit_engine`, making it discoverable across nodes.
-*   **Named Subjects:** Messages are sent to the engine using named subjects, enabling location-transparent communication.
-*   **Cookie-Based Authentication:** Nodes use a shared cookie (`secret`) for secure inter-node communication.
-
-### 4.3 Data Structures
-
-*   **Dictionaries (Maps):** Used for O(1) lookup of users, subreddits, and comments by ID.
-*   **Sets:** Used for tracking subreddit subscribers and user subscriptions, providing efficient membership testing.
-*   **Lists:** Used for storing posts within subreddits and messages in user inboxes.
-
-### 4.4 Zipf Distribution Implementation
-
-The simulator implements Zipf's law for realistic subreddit popularity:
-
-```gleam
-// Weight for rank r is 1/r
-weights = [1.0, 0.5, 0.333, 0.25, 0.2, 0.167, 0.143, 0.125]
+# In another terminal, build and run the client in Docker
+docker build -t reddit-client .
+docker run --rm reddit-client
 ```
 
-Power users strictly follow this distribution, while regular users use a 70/30 mix of Zipf and uniform random selection, simulating diverse user behavior.
+### Run the Signed Posts Demo
+```bash
+./demo_signed_posts.sh
+```
+Demonstrates digital signature workflow.
 
-## 5. Instructions to Run
+---
 
-To run the Reddit Engine and Client Simulator, follow these steps:
+## Bonus: Digital Signature Implementation
 
-1.  **Navigate to the Project Directory:**
-    ```bash
-    cd $HOME/Documents/Code/Distributed-Operating-System-Principles-COP5615-/proj4/reddit_engine
-    ```
+### Overview
+Users can register with an RSA-2048 public key. When posting, they sign the content with their private key. The server verifies signatures when posts are retrieved.
 
-2.  **Start the Reddit Engine:**
-    Open a new terminal and run the engine. This will start an Erlang node and register the `reddit_engine` globally.
-    ```bash
-    gleam run
-    ```
-    You should see output indicating the engine has started and is waiting for messages.
+### How It Works
 
-3.  **Start the Client Simulator:**
-    Open another new terminal and run the client simulator. This will connect to the engine node and begin simulating user activity.
-    ```bash
-    gleam run -m client_simulator
-    ```
-    The simulator will print progress messages, including user spawning, subreddit creation, and activity logs. At the end, it will report subreddit membership distribution and engine performance metrics.
+1. **Key Generation** (client-side with OpenSSL):
+   ```bash
+   openssl genrsa -out private_key.pem 2048
+   openssl rsa -in private_key.pem -RSAPublicKey_out -out public_key.pem
+   ```
 
-**Note:** Ensure that both the engine and the simulator are running on the same machine or within a network where Erlang nodes can communicate. The `server_node` in `client_simulator.gleam` (`reddit_engine@Yashs-MacBook-Air.local`) might need to be adjusted if your hostname is different. You can find your hostname by running `hostname` in your terminal.
+2. **Registration with Public Key**:
+   ```bash
+   curl -X POST /users -d "username=bob&public_key=<PEM_ENCODED>"
+   ```
 
-### 5.1 Configuration Options
+3. **Signing Posts** (`sign.gleam`):
+   - Takes content and private key as arguments
+   - Uses `rsa_keys` library to sign with SHA256 hash
+   - Returns base64-encoded signature
 
-You can adjust the simulation parameters in `client_simulator.gleam`:
+4. **Creating Signed Post**:
+   ```bash
+   curl -X POST /subreddits/<sub>/posts \
+     -H "Authorization: Username bob" \
+     -d "title=...&content=...&signature=<BASE64_SIG>"
+   ```
 
-*   `total_users` (line 9): Change the number of simulated users (default: 100)
-*   `subreddits_by_rank` (lines 12-21): Modify subreddit list and rankings
-*   User behavior parameters:
-    *   Power user ratio: `i <= total_users / 10` (line 125)
-    *   Online/offline durations (lines 145-152)
-    *   Activity probabilities (lines 163-226)
+5. **Verification on Retrieval**:
+   - When fetching feeds, server retrieves author's public key
+   - Verifies signature against post content
+   - Returns `signature_verified: true/false` in response, in case user does not have a public key associated, the value is by default, false
 
-## 6. Conclusion
+### Crypto Library
+Uses `rsa_keys` Gleam library which wraps Erlang's `public_key` module for RSA operations with SHA256 hashing.
 
-This project successfully implements a distributed Reddit-like engine with a comprehensive simulator that demonstrates:
+---
 
-1. **Functional Requirements:** All required features are implemented including user registration, subreddit management, posting, hierarchical commenting, voting, karma calculation, feed generation, and direct messaging.
+## Simulator Details
 
-2. **Distributed Architecture:** The system uses Erlang's distributed capabilities to separate client and server processes across nodes, with efficient message passing and global process discovery.
+### Zipf Distribution for Subreddit Popularity
 
-3. **Realistic Simulation:** The simulator models realistic user behavior including:
-   *   Differentiation between power users and regular users
-   *   Online/offline cycles simulating intermittent connectivity
-   *   Zipf distribution for subreddit popularity
-   *   Diverse activity patterns with appropriate probabilities
-
-4. **Performance:** With 900,000 concurrent users, the engine achieved:
-   *   **10,334.378 posts/second**
-   *   **2,615.76 messages/second**
-   *   2,590,019 total posts created
-   *   3,247,413 total operations (posts + comments + votes + messages)
-   *   250.62 seconds simulation duration
-
-5. **Scalability:** The actor-based architecture allows the system to scale to thousands of concurrent users by leveraging Erlang's lightweight processes and efficient message passing.
-
-### Future Enhancements (Part II)
-
-*   REST API implementation using a web framework
-*   WebSocket support for real-time updates
-*   Frontend web client
-*   Persistent storage for data durability
-*   Load balancing across multiple engine nodes
-*   Enhanced analytics and monitoring
-
-## 7. Project Structure
+The simulator models realistic subreddit popularity using Zipf's law, where the probability of joining a subreddit at rank *r* is proportional to 1/*r*:
 
 ```
-proj4/
-├── reddit_engine/
-│   ├── src/
-│   │   ├── reddit_engine.gleam       # Main engine implementation
-│   │   ├── client_simulator.gleam    # Client simulator
-│   │   ├── models.gleam              # Data models (User, Post, Comment, etc.)
-│   │   └── distr.erl                 # Erlang FFI for distributed operations
-│   ├── gleam.toml                    # Project configuration
-│   ├── manifest.toml                 # Dependency manifest
-└── REPORT.md                         # This report
+Rank 1 (gaming):      36.0% probability
+Rank 2 (technology):  18.0% probability
+Rank 3 (movies):      12.0% probability
+...and so on
 ```
 
-## 8. References
+This ensures popular subreddits get disproportionately more members, mimicking real Reddit behavior.
 
-*   Reddit API: https://www.reddit.com/dev/api/
-*   Gleam Language: https://gleam.run/
-*   Erlang Distribution: https://www.erlang.org/doc/reference_manual/distributed.html
-*   Zipf's Law: https://en.wikipedia.org/wiki/Zipf%27s_law
+### User Behavior Simulation
+
+Each simulated user actor performs:
+1. **Registration** → registers via REST API
+2. **Join subreddits** → follows Zipf distribution
+3. **Activity cycles** → alternates between online (active) and offline (idle) periods
+4. **Actions while online**: create posts (30%), comment (20%), vote (20%), send DMs (20%), check feed (10%)
+
+### Configuration
+
+Edit `client_simulator.gleam` to adjust:
+- `clients` constant: number of simulated users (default: 999)
+- `api_host` / `api_port`: server address
+- `subreddits_by_rank`: list of subreddits with popularity rankings
+
+---
+
+## Project Structure
+
+```
+reddit_engine/
+├── src/
+│   ├── reddit_engine.gleam      # Main engine actor and handlers
+│   ├── client_simulator.gleam   # Concurrent user simulator
+│   ├── models.gleam             # Data types (User, Post, Comment, etc.)
+│   ├── sign.gleam               # CLI signing utility (bonus)
+│   └── api/
+│       ├── router.gleam         # REST API route handlers
+│       └── middleware.gleam     # Auth and request middleware
+├── demo_main.sh                 # Interactive API demo script
+├── demo_signed_posts.sh         # Bonus signature demo script
+├── Dockerfile                   # For running simulator over network
+└── gleam.toml                   # Project dependencies
+```
+
+---
+
+## References
+
+- Gleam Language: https://gleam.run/
+- Wisp Web Framework: https://hexdocs.pm/wisp/
+- Erlang OTP: https://www.erlang.org/doc/
+- Reddit API (inspiration): https://www.reddit.com/dev/api/
+- Zipf's Law: https://en.wikipedia.org/wiki/Zipf%27s_law

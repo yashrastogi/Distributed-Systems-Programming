@@ -26,6 +26,8 @@ gleam_httpc = ">= 5.0.0 and < 6.0.0"
 ywt_core = ">= 1.0.1 and < 2.0.0"
 ywt_erlang = ">= 1.0.0 and < 2.0.0"
 rsa_keys = ">= 2.1.0 and < 3.0.0"
+dot_env = ">= 1.2.0 and < 2.0.0"
+argv = ">= 1.0.2 and < 2.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

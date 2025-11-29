@@ -1,20 +1,25 @@
+import argv
 import gleam/bit_array
-import gleam/result.{try}
+import gleam/io
 import rsa_keys
 
 pub fn main() {
-  let #(pubkey, prvtkey) = rsa_keys.generate_rsa_keys()
+  case argv.load().arguments {
+    [content, priv_key] -> {
+      let message = bit_array.from_string(content)
+      let private_key = priv_key
+      let signature =
+        rsa_keys.sign_message_with_pem_string(
+          message: message,
+          private_key_pem: private_key,
+        )
 
-  let result = {
-    use signature <- result.try(rsa_keys.sign_message(
-      bit_array.from_string("ola mundo"),
-      prvtkey,
-    ))
-    rsa_keys.verify_message(
-      message: bit_array.from_string("ola mundo"),
-      public_key: pubkey,
-      signature: signature,
-    )
+      let signature_b64 = case signature {
+        Ok(sig) -> bit_array.base64_encode(sig, False)
+        Error(_) -> "SIGNING_FAILED"
+      }
+      io.println(signature_b64)
+    }
+    _ -> io.println("usage: ./program <content> <priv_key>")
   }
-  echo result
 }

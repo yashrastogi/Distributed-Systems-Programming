@@ -15,7 +15,7 @@ import gleam/time/timestamp
 import gleam/uri
 import models.{type PerformanceMetrics}
 
-const clients = 9999
+const clients = 999
 
 const api_host = "192.168.139.3"
 

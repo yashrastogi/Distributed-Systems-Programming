@@ -6,12 +6,14 @@ import gleam/http.{Delete, Get, Post, Put}
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/time/timestamp
 import gleam/uri
 import models.{
   type DirectMessage, type EngineMessage, type PerformanceMetrics, type Post,
   type SubredditId, Downvote, GetEngineMetrics, Upvote,
 }
+import rsa_keys
 import wisp
 
 pub fn handle_request(
@@ -139,12 +141,12 @@ pub fn handle_request(
       // Validate that the authenticated user is requesting their own feed
       case auth_user == username {
         True -> {
-          let result =
+          let feed_result =
             process.call(engine_inbox, 100_000, fn(r) {
               models.GetFeed(username, r)
             })
 
-          case result {
+          case feed_result {
             Ok(posts) -> {
               let posts_to_json = fn(posts: List(#(SubredditId, Post))) -> String {
                 json.object([
@@ -152,10 +154,35 @@ pub fn handle_request(
                     "posts",
                     json.array(
                       list.map(posts, fn(post) {
+                        let verified = case { post.1 }.signature {
+                          Some(signature) -> {
+                            let author_public_key = case
+                              process.call(engine_inbox, 100_000, fn(r) {
+                                models.GetPublicKey({ post.1 }.author, r)
+                              })
+                            {
+                              Ok(Some(public_key)) -> public_key.key_value
+                              _ -> ""
+                            }
+
+                            rsa_keys.verify_message_with_pem_string(
+                              { post.1 }.content |> bit_array.from_string,
+                              author_public_key,
+                              signature
+                                |> bit_array.base64_decode
+                                |> result.unwrap(bit_array.from_string("")),
+                            )
+                            |> result.unwrap(False)
+                          }
+
+                          None -> False
+                        }
+
                         [
                           #("subreddit_id", json.string(post.0)),
                           #("title", json.string({ post.1 }.title)),
                           #("content", json.string({ post.1 }.content)),
+                          #("signature_verified", json.bool(verified)),
                           #("author", json.string({ post.1 }.author)),
                           #("upvote", json.int({ post.1 }.upvote)),
                           #("downvote", json.int({ post.1 }.downvote)),
